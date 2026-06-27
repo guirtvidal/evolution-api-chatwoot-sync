@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ghcr.io/guirtvidal/evolution-api-chatwoot-sync:latest
+    image: starttrust/evolution-api-chatwoot-sync:latest
     restart: unless-stopped
     depends_on:
       postgres:
