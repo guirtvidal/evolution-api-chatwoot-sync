@@ -14,7 +14,7 @@ type ChatwootUser = {
 };
 
 type FksChatwoot = {
-  phone_number: string;
+  conversation_key: string;
   contact_id: string;
   conversation_id: string;
 };
@@ -25,6 +25,15 @@ type firstLastTimestamp = {
 };
 
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
+
+type ChatwootConversationSeed = {
+  conversation_key: string;
+  identifier: string;
+  phone_number: string | null;
+  name: string;
+  created_at: number;
+  last_activity_at: number;
+};
 
 class ChatwootImport {
   private logger = new Logger('ChatwootImport');
@@ -112,9 +121,9 @@ class ChatwootImport {
         const bindInsert = [provider.accountId];
 
         for (const contact of contactsChunk) {
-          const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
+          const isGroup = this.isGroup(contact.remoteJid);
 
-          const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
+          const contactName = this.getContactName(contact);
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
@@ -241,14 +250,14 @@ class ChatwootImport {
         const aMessageTimestamp = a.messageTimestamp as any as number;
         const bMessageTimestamp = b.messageTimestamp as any as number;
 
-        return parseInt(aKey.remoteJid) - parseInt(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
+        return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
-      const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
-      // Map structure: +552199999999 => { first message timestamp from number, last message timestamp from number}
-      const phoneNumbersWithTimestamp = new Map<string, firstLastTimestamp>();
-      allMessagesMappedByPhoneNumber.forEach((messages: Message[], phoneNumber: string) => {
-        phoneNumbersWithTimestamp.set(phoneNumber, {
+      const allMessagesMappedByConversation = this.createMessagesMapByConversation(messagesOrdered);
+      // Map structure: +552199999999 or 120363...@g.us => { first message timestamp, last message timestamp}
+      const conversationsWithTimestamp = new Map<string, firstLastTimestamp>();
+      allMessagesMappedByConversation.forEach((messages: Message[], conversationKey: string) => {
+        conversationsWithTimestamp.set(conversationKey, {
           first: messages[0]?.messageTimestamp as any as number,
           last: messages[messages.length - 1]?.messageTimestamp as any as number,
         });
@@ -260,15 +269,16 @@ class ChatwootImport {
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
       while (messagesChunk.length > 0) {
-        // Map structure: +552199999999 => Message[]
-        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk);
+        // Map structure: +552199999999 or 120363...@g.us => Message[]
+        const messagesByConversation = this.createMessagesMapByConversation(messagesChunk);
 
-        if (messagesByPhoneNumber.size > 0) {
+        if (messagesByConversation.size > 0) {
           const fksByNumber = await this.selectOrCreateFksFromChatwoot(
             provider,
             inbox,
-            phoneNumbersWithTimestamp,
-            messagesByPhoneNumber,
+            conversationsWithTimestamp,
+            messagesByConversation,
+            this.createContactNameMap(instance),
           );
 
           // inserting messages in chatwoot db
@@ -277,8 +287,8 @@ class ChatwootImport {
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
           const bindInsertMsg = [provider.accountId, inbox.id];
 
-          messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
-            const fksChatwoot = fksByNumber.get(phoneNumber);
+          messagesByConversation.forEach((messages: any[], conversationKey: string) => {
+            const fksChatwoot = fksByNumber.get(conversationKey);
 
             messages.forEach((message) => {
               if (!message.message) {
@@ -351,42 +361,66 @@ class ChatwootImport {
   public async selectOrCreateFksFromChatwoot(
     provider: ChatwootModel,
     inbox: inbox,
-    phoneNumbersWithTimestamp: Map<string, firstLastTimestamp>,
-    messagesByPhoneNumber: Map<string, Message[]>,
+    conversationsWithTimestamp: Map<string, firstLastTimestamp>,
+    messagesByConversation: Map<string, Message[]>,
+    contactNamesByIdentifier = new Map<string, string>(),
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
 
     const bindValues = [provider.accountId, inbox.id];
-    const phoneNumberBind = Array.from(messagesByPhoneNumber.keys())
-      .map((phoneNumber) => {
-        const phoneNumberTimestamp = phoneNumbersWithTimestamp.get(phoneNumber);
+    const conversationSeeds = Array.from(messagesByConversation.entries())
+      .map(([conversationKey, messages]) => {
+        const conversationTimestamp = conversationsWithTimestamp.get(conversationKey);
 
-        if (phoneNumberTimestamp) {
-          bindValues.push(phoneNumber);
-          let bindStr = `($${bindValues.length},`;
-
-          bindValues.push(phoneNumberTimestamp.first);
-          bindStr += `$${bindValues.length},`;
-
-          bindValues.push(phoneNumberTimestamp.last);
-          return `${bindStr}$${bindValues.length})`;
+        if (!conversationTimestamp) {
+          return null;
         }
+
+        const seed = this.createConversationSeed(
+          conversationKey,
+          messages,
+          conversationTimestamp,
+          contactNamesByIdentifier,
+        );
+
+        bindValues.push(seed.conversation_key);
+        let bindStr = `($${bindValues.length},`;
+
+        bindValues.push(seed.identifier);
+        bindStr += `$${bindValues.length},`;
+
+        bindValues.push(seed.phone_number);
+        bindStr += `$${bindValues.length},`;
+
+        bindValues.push(seed.name);
+        bindStr += `$${bindValues.length},`;
+
+        bindValues.push(seed.created_at);
+        bindStr += `$${bindValues.length},`;
+
+        bindValues.push(seed.last_activity_at);
+        return `${bindStr}$${bindValues.length})`;
       })
+      .filter(Boolean)
       .join(',');
+
+    if (!conversationSeeds) {
+      return new Map();
+    }
 
     // select (or insert when necessary) data from tables contacts, contact_inboxes, conversations from chatwoot db
     const sqlFromChatwoot = `WITH
-              phone_number AS (
-                SELECT phone_number, created_at::INTEGER, last_activity_at::INTEGER FROM (
+              conversation_seed AS (
+                SELECT conversation_key, identifier, phone_number, name, created_at::INTEGER, last_activity_at::INTEGER FROM (
                   VALUES 
-                   ${phoneNumberBind}
-                 ) as t (phone_number, created_at, last_activity_at)
+                   ${conversationSeeds}
+                 ) as t (conversation_key, identifier, phone_number, name, created_at, last_activity_at)
               ),
 
-              only_new_phone_number AS (
-                SELECT * FROM phone_number
-                WHERE phone_number NOT IN (
-                  SELECT phone_number
+              only_new_conversation_seed AS (
+                SELECT * FROM conversation_seed
+                WHERE identifier NOT IN (
+                  SELECT identifier
                   FROM contacts
                     JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
                     JOIN conversations con ON con.contact_inbox_id = ci.id 
@@ -399,11 +433,10 @@ class ChatwootImport {
 
               new_contact AS (
                 INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
-                SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1, CONCAT(REPLACE(p.phone_number, '+', ''),
-                  '@s.whatsapp.net'), to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
-                FROM only_new_phone_number AS p
+                SELECT p.name, p.phone_number, $1, p.identifier, to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
+                FROM only_new_conversation_seed AS p
                 ON CONFLICT(identifier, account_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
-                RETURNING id, phone_number, created_at, updated_at
+                RETURNING id, identifier, created_at, updated_at
               ),
 
               new_contact_inbox AS (
@@ -422,22 +455,23 @@ class ChatwootImport {
                 RETURNING id, contact_id
               )
 
-              SELECT new_contact.phone_number, new_conversation.contact_id, new_conversation.id AS conversation_id
+              SELECT seed.conversation_key, new_conversation.contact_id, new_conversation.id AS conversation_id
               FROM new_conversation 
               JOIN new_contact ON new_conversation.contact_id = new_contact.id
+              JOIN conversation_seed seed ON seed.identifier = new_contact.identifier
 
               UNION
 
-              SELECT p.phone_number, c.id contact_id, con.id conversation_id
-                FROM phone_number p
-              JOIN contacts c ON c.phone_number = p.phone_number
+              SELECT p.conversation_key, c.id contact_id, con.id conversation_id
+                FROM conversation_seed p
+              JOIN contacts c ON c.identifier = p.identifier
               JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
               JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
                 AND con.inbox_id = $2 AND con.contact_id = c.id`;
 
     const fksFromChatwoot = await pgClient.query(sqlFromChatwoot, bindValues);
 
-    return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.phone_number, item]));
+    return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.conversation_key, item]));
   }
 
   public async getChatwootUser(provider: ChatwootModel): Promise<ChatwootUser> {
@@ -454,23 +488,89 @@ class ChatwootImport {
     }
   }
 
-  public createMessagesMapByPhoneNumber(messages: Message[]): Map<string, Message[]> {
+  public createMessagesMapByConversation(messages: Message[]): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
       const key = message?.key as {
         remoteJid: string;
       };
-      if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        const phoneNumber = key?.remoteJid?.split('@')[0];
-        if (phoneNumber) {
-          const phoneNumberPlus = `+${phoneNumber}`;
-          const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
+      if (!this.isIgnoredRemoteJid(key?.remoteJid)) {
+        const conversationKey = this.getConversationKey(key?.remoteJid);
+        if (conversationKey) {
+          const messages = acc.has(conversationKey) ? acc.get(conversationKey) : [];
           messages.push(message);
-          acc.set(phoneNumberPlus, messages);
+          acc.set(conversationKey, messages);
         }
       }
 
       return acc;
     }, new Map());
+  }
+
+  private createContactNameMap(instance: InstanceDto) {
+    const contacts = this.historyContacts.get(instance.instanceName) || [];
+
+    return contacts.reduce((acc, contact) => {
+      acc.set(contact.remoteJid, this.getContactName(contact));
+
+      return acc;
+    }, new Map<string, string>());
+  }
+
+  private createConversationSeed(
+    conversationKey: string,
+    messages: Message[],
+    conversationTimestamp: firstLastTimestamp,
+    contactNamesByIdentifier: Map<string, string>,
+  ): ChatwootConversationSeed {
+    const firstMessage = messages[0] as Message & { key?: { remoteJid?: string } };
+    const remoteJid = firstMessage?.key?.remoteJid || conversationKey;
+    const isGroup = this.isGroup(remoteJid);
+    const identifier = isGroup ? remoteJid : `${conversationKey.replace('+', '')}@s.whatsapp.net`;
+    const phoneNumber = isGroup ? null : conversationKey;
+    const name = isGroup
+      ? this.getGroupName(remoteJid, contactNamesByIdentifier.get(remoteJid))
+      : contactNamesByIdentifier.get(remoteJid) || conversationKey.replace('+', '');
+
+    return {
+      conversation_key: conversationKey,
+      identifier,
+      phone_number: phoneNumber,
+      name,
+      created_at: conversationTimestamp.first,
+      last_activity_at: conversationTimestamp.last,
+    };
+  }
+
+  private getConversationKey(remoteJid?: string) {
+    if (!remoteJid) {
+      return null;
+    }
+
+    if (this.isGroup(remoteJid)) {
+      return remoteJid;
+    }
+
+    const phoneNumber = remoteJid.split('@')[0]?.split(':')[0];
+
+    return phoneNumber ? `+${phoneNumber}` : null;
+  }
+
+  private getContactName(contact: Contact) {
+    if (this.isGroup(contact.remoteJid)) {
+      return this.getGroupName(contact.remoteJid, contact.pushName);
+    }
+
+    return contact.pushName || contact.remoteJid.split('@')[0];
+  }
+
+  private getGroupName(remoteJid: string, name?: string | null) {
+    const cleanName = name?.trim();
+
+    if (cleanName && cleanName.toUpperCase() !== 'GROUP') {
+      return cleanName.endsWith('(GROUP)') ? cleanName : `${cleanName} (GROUP)`;
+    }
+
+    return `${remoteJid.split('@')[0]} (GROUP)`;
   }
 
   public async getContactsOrderByRecentConversations(
@@ -561,7 +661,11 @@ class ChatwootImport {
   }
 
   public isGroup(remoteJid: string) {
-    return remoteJid.includes('@g.us');
+    return remoteJid?.includes('@g.us');
+  }
+
+  public isIgnoredRemoteJid(remoteJid: string) {
+    return !remoteJid || remoteJid === 'status@broadcast' || remoteJid === '0@s.whatsapp.net';
   }
 
   public isIgnorePhoneNumber(remoteJid: string) {

@@ -2655,7 +2655,7 @@ export class ChatwootService {
     if (provider.importMessages && messagesRaw.length > 0) {
       this.addHistoryMessages(
         instanceForImport,
-        messagesRaw.filter((msg: any) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+        messagesRaw.filter((msg: any) => !chatwootImport.isIgnoredRemoteJid(msg.key?.remoteJid)),
       );
     }
 
@@ -2781,7 +2781,7 @@ export class ChatwootService {
       });
 
       const filteredMessages = savedMessages.filter(
-        (msg: any) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid),
+        (msg: any) => !chatwootImport.isIgnoredRemoteJid(msg.key?.remoteJid),
       );
       const messagesRaw: any[] = [];
       for (const m of filteredMessages) {
@@ -2798,7 +2798,7 @@ export class ChatwootService {
 
       this.addHistoryMessages(
         instance,
-        messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+        messagesRaw.filter((msg) => !chatwootImport.isIgnoredRemoteJid(msg.key?.remoteJid)),
       );
 
       await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
