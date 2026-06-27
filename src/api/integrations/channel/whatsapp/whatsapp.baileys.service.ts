@@ -789,8 +789,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       for (const chat of chats) {
         await this.prismaRepository.chat.updateMany({
-          where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
-          data: { remoteJid: chat.id },
+          where: { instanceId: this.instanceId, remoteJid: chat.id },
+          data: { remoteJid: chat.id, name: chat.name },
         });
       }
     },
@@ -1063,7 +1063,7 @@ export class BaileysStartupService extends ChannelStartupService {
         ) {
           this.chatwootService.addHistoryMessages(
             instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+            messagesRaw.filter((msg) => !chatwootImport.isIgnoredRemoteJid(msg.key?.remoteJid)),
           );
         }
 

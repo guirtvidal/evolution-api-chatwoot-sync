@@ -2629,7 +2629,7 @@ export class ChatwootService {
     const daysLimitToImport = provider.daysLimitImportMessages ?? 7;
     const timestampLimitToImport = dayjs().subtract(daysLimitToImport, 'days').unix();
 
-    const [contactsRaw, messagesRaw] = await Promise.all([
+    const [contactsRaw, messagesRaw, chatsRaw] = await Promise.all([
       this.prismaRepository.contact.findMany({
         where: {
           instanceId: instanceForImport.instanceId,
@@ -2646,10 +2646,24 @@ export class ChatwootService {
           messageTimestamp: 'asc',
         },
       }),
+      this.prismaRepository.chat.findMany({
+        where: {
+          instanceId: instanceForImport.instanceId,
+        },
+      }),
     ]);
 
-    if (provider.importContacts && contactsRaw.length > 0) {
-      this.addHistoryContacts(instanceForImport, contactsRaw);
+    const groupNamesByJid = await this.getGroupNamesForImport(instanceForImport, chatsRaw);
+    const contactsForImport = this.prepareContactsForChatwootImport(
+      instanceForImport.instanceId,
+      contactsRaw,
+      chatsRaw,
+      messagesRaw,
+      groupNamesByJid,
+    );
+
+    if ((provider.importContacts || provider.importMessages) && contactsForImport.length > 0) {
+      this.addHistoryContacts(instanceForImport, contactsForImport);
     }
 
     if (provider.importMessages && messagesRaw.length > 0) {
@@ -2686,6 +2700,94 @@ export class ChatwootService {
         : totalContactsImported,
       totalMessagesImported,
     };
+  }
+
+  private async getGroupNamesForImport(
+    instance: InstanceDto,
+    chatsRaw: { remoteJid: string; name?: string | null }[],
+  ): Promise<Map<string, string>> {
+    const groupNamesByJid = new Map<string, string>();
+
+    chatsRaw
+      .filter((chat) => chat.remoteJid?.includes('@g.us') && chat.name?.trim())
+      .forEach((chat) => groupNamesByJid.set(chat.remoteJid, chat.name.trim()));
+
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    const client = waInstance?.client;
+    if (!client) {
+      return groupNamesByJid;
+    }
+
+    try {
+      const groups = Object.values((await client.groupFetchAllParticipating?.()) || {}) as any[];
+      groups.forEach((group) => {
+        const groupName = (group?.subject || group?.Name || group?.name)?.trim?.();
+        if (group?.id && groupName) {
+          groupNamesByJid.set(group.id, groupName);
+        }
+      });
+    } catch (error) {
+      this.logger.warn(`Unable to fetch all WhatsApp groups for Chatwoot import: ${error?.toString?.() || error}`);
+    }
+
+    const groupJids = chatsRaw.filter((chat) => chat.remoteJid?.includes('@g.us')).map((chat) => chat.remoteJid);
+    for (const groupJid of groupJids) {
+      if (groupNamesByJid.has(groupJid)) {
+        continue;
+      }
+
+      try {
+        const group = await client.groupMetadata(groupJid);
+        const groupName = (group?.subject || group?.Name || group?.name)?.trim?.();
+        if (groupName) {
+          groupNamesByJid.set(groupJid, groupName);
+        }
+      } catch (error) {
+        this.logger.warn(`Unable to fetch WhatsApp group metadata for ${groupJid}: ${error?.toString?.() || error}`);
+      }
+    }
+
+    return groupNamesByJid;
+  }
+
+  private prepareContactsForChatwootImport(
+    instanceId: string,
+    contactsRaw: ContactModel[],
+    chatsRaw: { remoteJid: string; name?: string | null; profilePicUrl?: string | null }[],
+    messagesRaw: MessageModel[],
+    groupNamesByJid: Map<string, string>,
+  ): ContactModel[] {
+    const contactsByJid = new Map<string, ContactModel>();
+
+    contactsRaw.forEach((contact) => contactsByJid.set(contact.remoteJid, contact));
+
+    const ensureGroupContact = (remoteJid?: string) => {
+      if (!remoteJid?.includes('@g.us')) {
+        return;
+      }
+
+      const existingContact = contactsByJid.get(remoteJid);
+      const groupName = groupNamesByJid.get(remoteJid);
+      const chat = chatsRaw.find((item) => item.remoteJid === remoteJid);
+      const pushName = groupName || chat?.name || existingContact?.pushName || remoteJid.split('@')[0];
+
+      contactsByJid.set(remoteJid, {
+        ...(existingContact || {
+          id: remoteJid,
+          remoteJid,
+          profilePicUrl: null,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+          instanceId,
+        }),
+        pushName,
+      } as ContactModel);
+    };
+
+    chatsRaw.forEach((chat) => ensureGroupContact(chat.remoteJid));
+    messagesRaw.forEach((message: any) => ensureGroupContact(message.key?.remoteJid));
+
+    return Array.from(contactsByJid.values());
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {

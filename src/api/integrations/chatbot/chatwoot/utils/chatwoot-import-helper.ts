@@ -435,8 +435,24 @@ class ChatwootImport {
                 INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
                 SELECT p.name, p.phone_number, $1, p.identifier, to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
                 FROM only_new_conversation_seed AS p
-                ON CONFLICT(identifier, account_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                ON CONFLICT(identifier, account_id) DO UPDATE SET
+                  name = EXCLUDED.name,
+                  phone_number = EXCLUDED.phone_number,
+                  updated_at = EXCLUDED.updated_at
                 RETURNING id, identifier, created_at, updated_at
+              ),
+
+              updated_contact AS (
+                UPDATE contacts
+                SET
+                  name = conversation_seed.name,
+                  phone_number = conversation_seed.phone_number,
+                  updated_at = NOW()
+                FROM conversation_seed
+                WHERE contacts.identifier = conversation_seed.identifier
+                  AND contacts.account_id = $1
+                  AND contacts.name IS DISTINCT FROM conversation_seed.name
+                RETURNING contacts.id, contacts.identifier
               ),
 
               new_contact_inbox AS (
