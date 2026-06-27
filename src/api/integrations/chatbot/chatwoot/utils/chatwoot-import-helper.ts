@@ -419,8 +419,8 @@ class ChatwootImport {
 
               only_new_conversation_seed AS (
                 SELECT * FROM conversation_seed
-                WHERE identifier NOT IN (
-                  SELECT identifier
+                WHERE conversation_seed.identifier NOT IN (
+                  SELECT contacts.identifier
                   FROM contacts
                     JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
                     JOIN conversations con ON con.contact_inbox_id = ci.id 

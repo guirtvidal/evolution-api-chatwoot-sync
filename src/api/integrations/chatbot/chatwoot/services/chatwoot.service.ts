@@ -2730,23 +2730,6 @@ export class ChatwootService {
       this.logger.warn(`Unable to fetch all WhatsApp groups for Chatwoot import: ${error?.toString?.() || error}`);
     }
 
-    const groupJids = chatsRaw.filter((chat) => chat.remoteJid?.includes('@g.us')).map((chat) => chat.remoteJid);
-    for (const groupJid of groupJids) {
-      if (groupNamesByJid.has(groupJid)) {
-        continue;
-      }
-
-      try {
-        const group = await client.groupMetadata(groupJid);
-        const groupName = (group?.subject || group?.Name || group?.name)?.trim?.();
-        if (groupName) {
-          groupNamesByJid.set(groupJid, groupName);
-        }
-      } catch (error) {
-        this.logger.warn(`Unable to fetch WhatsApp group metadata for ${groupJid}: ${error?.toString?.() || error}`);
-      }
-    }
-
     return groupNamesByJid;
   }
 
