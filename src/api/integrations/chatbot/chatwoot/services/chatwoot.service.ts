@@ -2653,7 +2653,12 @@ export class ChatwootService {
       }),
     ]);
 
-    const { groupNamesByJid, totalGroupsSynced } = await this.syncGroupNamesForImport(instanceForImport, chatsRaw);
+    const { groupNamesByJid, totalGroupsSynced } = await this.syncGroupNamesForImport(
+      instanceForImport,
+      chatsRaw,
+      contactsRaw,
+      messagesRaw,
+    );
     const contactsForImport = this.prepareContactsForChatwootImport(
       instanceForImport.instanceId,
       contactsRaw,
@@ -2706,13 +2711,42 @@ export class ChatwootService {
   private async syncGroupNamesForImport(
     instance: InstanceDto,
     chatsRaw: { remoteJid: string; name?: string | null }[],
+    contactsRaw: ContactModel[],
+    messagesRaw: MessageModel[],
   ): Promise<{ groupNamesByJid: Map<string, string>; totalGroupsSynced: number }> {
     const groupNamesByJid = new Map<string, string>();
     const syncedGroups: { remoteJid: string; name: string }[] = [];
+    const groupsNeedingSync = new Set<string>();
 
     chatsRaw
       .filter((chat) => chat.remoteJid?.includes('@g.us') && this.isUsableGroupName(chat.remoteJid, chat.name))
       .forEach((chat) => groupNamesByJid.set(chat.remoteJid, this.normalizeGroupSubject(chat.name)));
+
+    contactsRaw
+      .filter(
+        (contact) =>
+          contact.remoteJid?.includes('@g.us') &&
+          !groupNamesByJid.has(contact.remoteJid) &&
+          this.isUsableGroupName(contact.remoteJid, contact.pushName),
+      )
+      .forEach((contact) => groupNamesByJid.set(contact.remoteJid, this.normalizeGroupSubject(contact.pushName)));
+
+    chatsRaw
+      .filter((chat) => chat.remoteJid?.includes('@g.us') && !groupNamesByJid.has(chat.remoteJid))
+      .forEach((chat) => groupsNeedingSync.add(chat.remoteJid));
+
+    contactsRaw
+      .filter((contact) => contact.remoteJid?.includes('@g.us') && !groupNamesByJid.has(contact.remoteJid))
+      .forEach((contact) => groupsNeedingSync.add(contact.remoteJid));
+
+    messagesRaw
+      .map((message: any) => message.key?.remoteJid)
+      .filter((remoteJid: string) => remoteJid?.includes('@g.us') && !groupNamesByJid.has(remoteJid))
+      .forEach((remoteJid: string) => groupsNeedingSync.add(remoteJid));
+
+    if (groupsNeedingSync.size === 0) {
+      return { groupNamesByJid, totalGroupsSynced: 0 };
+    }
 
     const waInstance = this.waMonitor.waInstances[instance.instanceName];
     const client = waInstance?.client;
@@ -2726,7 +2760,7 @@ export class ChatwootService {
         const groupJid = group?.id || group?.JID || group?.jid;
         const groupName = this.normalizeGroupSubject(group?.subject || group?.Name || group?.name);
 
-        if (groupJid && this.isUsableGroupName(groupJid, groupName)) {
+        if (groupJid && groupsNeedingSync.has(groupJid) && this.isUsableGroupName(groupJid, groupName)) {
           groupNamesByJid.set(groupJid, groupName);
           syncedGroups.push({ remoteJid: groupJid, name: groupName });
         }
