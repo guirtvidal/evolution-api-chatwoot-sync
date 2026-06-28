@@ -411,14 +411,21 @@ class ChatwootImport {
     // select (or insert when necessary) data from tables contacts, contact_inboxes, conversations from chatwoot db
     const sqlFromChatwoot = `WITH
               conversation_seed AS (
-                SELECT conversation_key, identifier, phone_number, name, created_at::INTEGER, last_activity_at::INTEGER FROM (
+                SELECT
+                  t.conversation_key,
+                  t.identifier,
+                  t.phone_number,
+                  t.name,
+                  t.created_at::INTEGER,
+                  t.last_activity_at::INTEGER
+                FROM (
                   VALUES 
                    ${conversationSeeds}
                  ) as t (conversation_key, identifier, phone_number, name, created_at, last_activity_at)
               ),
 
               only_new_conversation_seed AS (
-                SELECT * FROM conversation_seed
+                SELECT conversation_seed.* FROM conversation_seed
                 WHERE conversation_seed.identifier NOT IN (
                   SELECT contacts.identifier
                   FROM contacts
@@ -432,14 +439,14 @@ class ChatwootImport {
               ),
 
               new_contact AS (
-                INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
+                INSERT INTO contacts AS contact (name, phone_number, account_id, identifier, created_at, updated_at)
                 SELECT p.name, p.phone_number, $1, p.identifier, to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
                 FROM only_new_conversation_seed AS p
                 ON CONFLICT(identifier, account_id) DO UPDATE SET
                   name = EXCLUDED.name,
                   phone_number = EXCLUDED.phone_number,
                   updated_at = EXCLUDED.updated_at
-                RETURNING id, identifier, created_at, updated_at
+                RETURNING contact.id, contact.identifier, contact.created_at, contact.updated_at
               ),
 
               updated_contact AS (
