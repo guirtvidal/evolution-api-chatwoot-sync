@@ -2653,7 +2653,7 @@ export class ChatwootService {
       }),
     ]);
 
-    const groupNamesByJid = await this.getGroupNamesForImport(instanceForImport, chatsRaw);
+    const { groupNamesByJid, totalGroupsSynced } = await this.syncGroupNamesForImport(instanceForImport, chatsRaw);
     const contactsForImport = this.prepareContactsForChatwootImport(
       instanceForImport.instanceId,
       contactsRaw,
@@ -2695,6 +2695,7 @@ export class ChatwootService {
     return {
       contactsFound: contactsRaw.length,
       messagesFound: messagesRaw.length,
+      groupsSynced: totalGroupsSynced,
       totalContactsImported: provider.importContacts
         ? totalContactsImported || contactsRaw.length
         : totalContactsImported,
@@ -2702,35 +2703,97 @@ export class ChatwootService {
     };
   }
 
-  private async getGroupNamesForImport(
+  private async syncGroupNamesForImport(
     instance: InstanceDto,
     chatsRaw: { remoteJid: string; name?: string | null }[],
-  ): Promise<Map<string, string>> {
+  ): Promise<{ groupNamesByJid: Map<string, string>; totalGroupsSynced: number }> {
     const groupNamesByJid = new Map<string, string>();
+    const syncedGroups: { remoteJid: string; name: string }[] = [];
 
     chatsRaw
-      .filter((chat) => chat.remoteJid?.includes('@g.us') && chat.name?.trim())
-      .forEach((chat) => groupNamesByJid.set(chat.remoteJid, chat.name.trim()));
+      .filter((chat) => chat.remoteJid?.includes('@g.us') && this.isUsableGroupName(chat.remoteJid, chat.name))
+      .forEach((chat) => groupNamesByJid.set(chat.remoteJid, this.normalizeGroupSubject(chat.name)));
 
     const waInstance = this.waMonitor.waInstances[instance.instanceName];
     const client = waInstance?.client;
-    if (!client) {
-      return groupNamesByJid;
+    if (!client || !instance.instanceId) {
+      return { groupNamesByJid, totalGroupsSynced: 0 };
     }
 
     try {
       const groups = Object.values((await client.groupFetchAllParticipating?.()) || {}) as any[];
       groups.forEach((group) => {
-        const groupName = (group?.subject || group?.Name || group?.name)?.trim?.();
-        if (group?.id && groupName) {
-          groupNamesByJid.set(group.id, groupName);
+        const groupJid = group?.id || group?.JID || group?.jid;
+        const groupName = this.normalizeGroupSubject(group?.subject || group?.Name || group?.name);
+
+        if (groupJid && this.isUsableGroupName(groupJid, groupName)) {
+          groupNamesByJid.set(groupJid, groupName);
+          syncedGroups.push({ remoteJid: groupJid, name: groupName });
         }
       });
+
+      await this.persistSyncedGroupNames(instance.instanceId, syncedGroups);
     } catch (error) {
       this.logger.warn(`Unable to fetch all WhatsApp groups for Chatwoot import: ${error?.toString?.() || error}`);
     }
 
-    return groupNamesByJid;
+    return { groupNamesByJid, totalGroupsSynced: new Set(syncedGroups.map((group) => group.remoteJid)).size };
+  }
+
+  private async persistSyncedGroupNames(instanceId: string, groups: { remoteJid: string; name: string }[]) {
+    const uniqueGroups = Array.from(new Map(groups.map((group) => [group.remoteJid, group])).values());
+    if (uniqueGroups.length === 0) {
+      return;
+    }
+
+    await Promise.all(
+      uniqueGroups.map((group) =>
+        Promise.all([
+          this.prismaRepository.chat.upsert({
+            where: {
+              instanceId_remoteJid: {
+                instanceId,
+                remoteJid: group.remoteJid,
+              },
+            },
+            create: {
+              instanceId,
+              remoteJid: group.remoteJid,
+              name: group.name,
+            },
+            update: {
+              name: group.name,
+            },
+          }),
+          this.prismaRepository.contact.upsert({
+            where: {
+              remoteJid_instanceId: {
+                remoteJid: group.remoteJid,
+                instanceId,
+              },
+            },
+            create: {
+              instanceId,
+              remoteJid: group.remoteJid,
+              pushName: group.name,
+            },
+            update: {
+              pushName: group.name,
+            },
+          }),
+        ]),
+      ),
+    );
+  }
+
+  private normalizeGroupSubject(name?: string | null) {
+    return name?.replace(/\s+\(GROUP\)$/i, '').trim() || '';
+  }
+
+  private isUsableGroupName(remoteJid: string, name?: string | null) {
+    const cleanName = this.normalizeGroupSubject(name);
+
+    return !!cleanName && cleanName.toUpperCase() !== 'GROUP' && cleanName !== remoteJid.split('@')[0];
   }
 
   private prepareContactsForChatwootImport(
