@@ -185,7 +185,10 @@ class ChatwootImport {
     }
   }
 
-  public async getExistingSourceIds(sourceIds: string[], conversationId?: number): Promise<Set<string>> {
+  public async getExistingSourceIds(
+    sourceIds: string[],
+    filters?: { conversationId?: number | string; accountId?: number | string; inboxId?: number | string },
+  ): Promise<Set<string>> {
     try {
       const existingSourceIdsSet = new Set<string>();
 
@@ -197,11 +200,25 @@ class ChatwootImport {
       const formattedSourceIds = sourceIds.map((sourceId) => `WAID:${sourceId.replace('WAID:', '')}`);
       const pgClient = postgresClient.getChatwootConnection();
 
-      const params = conversationId ? [formattedSourceIds, conversationId] : [formattedSourceIds];
+      const params: (string[] | number | string)[] = [formattedSourceIds];
+      const where = ['source_id = ANY($1)'];
 
-      const query = conversationId
-        ? 'SELECT source_id FROM messages WHERE source_id = ANY($1) AND conversation_id = $2'
-        : 'SELECT source_id FROM messages WHERE source_id = ANY($1)';
+      if (filters?.conversationId) {
+        params.push(filters.conversationId);
+        where.push(`conversation_id = $${params.length}`);
+      }
+
+      if (filters?.accountId) {
+        params.push(filters.accountId);
+        where.push(`account_id = $${params.length}`);
+      }
+
+      if (filters?.inboxId) {
+        params.push(filters.inboxId);
+        where.push(`inbox_id = $${params.length}`);
+      }
+
+      const query = `SELECT source_id FROM messages WHERE ${where.join(' AND ')}`;
 
       const result = await pgClient.query(query, params);
       for (const row of result.rows) {
@@ -263,7 +280,10 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
+      const existingSourceIds = await this.getExistingSourceIds(
+        messagesOrdered.map((message: any) => message.key.id),
+        { accountId: provider.accountId, inboxId: inbox.id },
+      );
       messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
       // processing messages in batch
       const batchSize = 4000;
@@ -285,7 +305,7 @@ class ChatwootImport {
           let sqlInsertMsg = `INSERT INTO messages
             (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type,
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
-          const bindInsertMsg = [provider.accountId, inbox.id];
+          const bindInsertMsg: (string | number)[] = [provider.accountId, inbox.id];
 
           messagesByConversation.forEach((messages: any[], conversationKey: string) => {
             const fksChatwoot = fksByNumber.get(conversationKey);
@@ -310,7 +330,7 @@ class ChatwootImport {
               bindInsertMsg.push(fksChatwoot.conversation_id);
               const bindConversationId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(message.key.fromMe ? '1' : '0');
+              bindInsertMsg.push(message.key.fromMe ? 1 : 0);
               const bindMessageType = `$${bindInsertMsg.length}`;
 
               bindInsertMsg.push(message.key.fromMe ? chatwootUser.user_type : 'Contact');
@@ -333,6 +353,7 @@ class ChatwootImport {
             if (sqlInsertMsg.slice(-1) === ',') {
               sqlInsertMsg = sqlInsertMsg.slice(0, -1);
             }
+            sqlInsertMsg += ' ON CONFLICT DO NOTHING';
             totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
           }
         }
@@ -424,24 +445,16 @@ class ChatwootImport {
                  ) as t (conversation_key, identifier, phone_number, name, created_at, last_activity_at)
               ),
 
-              only_new_conversation_seed AS (
-                SELECT conversation_seed.* FROM conversation_seed
-                WHERE conversation_seed.identifier NOT IN (
-                  SELECT contacts.identifier
-                  FROM contacts
-                    JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
-                    JOIN conversations con ON con.contact_inbox_id = ci.id 
-                      AND con.account_id = $1
-                      AND con.inbox_id = $2
-                      AND con.contact_id = contacts.id
-                  WHERE contacts.account_id = $1
-                )
-              ),
-
-              new_contact AS (
+              upserted_contact AS (
                 INSERT INTO contacts AS contact (name, phone_number, account_id, identifier, created_at, updated_at)
-                SELECT p.name, p.phone_number, $1, p.identifier, to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
-                FROM only_new_conversation_seed AS p
+                SELECT
+                  conversation_seed.name,
+                  conversation_seed.phone_number,
+                  $1,
+                  conversation_seed.identifier,
+                  to_timestamp(conversation_seed.created_at),
+                  to_timestamp(conversation_seed.last_activity_at)
+                FROM conversation_seed
                 ON CONFLICT(identifier, account_id) DO UPDATE SET
                   name = EXCLUDED.name,
                   phone_number = EXCLUDED.phone_number,
@@ -449,48 +462,120 @@ class ChatwootImport {
                 RETURNING contact.id, contact.identifier, contact.created_at, contact.updated_at
               ),
 
-              updated_contact AS (
-                UPDATE contacts
-                SET
-                  name = conversation_seed.name,
-                  phone_number = conversation_seed.phone_number,
-                  updated_at = NOW()
+              selected_contact AS (
+                SELECT
+                  conversation_seed.conversation_key,
+                  conversation_seed.created_at,
+                  conversation_seed.last_activity_at,
+                  upserted_contact.id AS contact_id
                 FROM conversation_seed
-                WHERE contacts.identifier = conversation_seed.identifier
-                  AND contacts.account_id = $1
-                  AND contacts.name IS DISTINCT FROM conversation_seed.name
-                RETURNING contacts.id, contacts.identifier
+                JOIN upserted_contact ON upserted_contact.identifier = conversation_seed.identifier
               ),
 
               new_contact_inbox AS (
                 INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
-                SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
-                FROM new_contact 
+                SELECT
+                  selected_contact.contact_id,
+                  $2,
+                  gen_random_uuid(),
+                  to_timestamp(selected_contact.created_at),
+                  to_timestamp(selected_contact.last_activity_at)
+                FROM selected_contact
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM contact_inboxes existing_ci
+                  WHERE existing_ci.contact_id = selected_contact.contact_id
+                    AND existing_ci.inbox_id = $2
+                )
                 RETURNING id, contact_id, created_at, updated_at
+              ),
+
+              existing_contact_inbox AS (
+                SELECT
+                  selected_contact.conversation_key,
+                  selected_contact.contact_id,
+                  selected_contact.created_at,
+                  selected_contact.last_activity_at,
+                  contact_inboxes.id AS contact_inbox_id,
+                  contact_inboxes.created_at AS contact_inbox_created_at,
+                  contact_inboxes.updated_at AS contact_inbox_updated_at
+                FROM selected_contact
+                JOIN contact_inboxes ON contact_inboxes.contact_id = selected_contact.contact_id
+                  AND contact_inboxes.inbox_id = $2
+              ),
+
+              selected_contact_inbox AS (
+                SELECT
+                  existing_contact_inbox.conversation_key,
+                  existing_contact_inbox.contact_id,
+                  existing_contact_inbox.created_at,
+                  existing_contact_inbox.last_activity_at,
+                  existing_contact_inbox.contact_inbox_id
+                FROM existing_contact_inbox
+
+                UNION ALL
+
+                SELECT
+                  selected_contact.conversation_key,
+                  selected_contact.contact_id,
+                  selected_contact.created_at,
+                  selected_contact.last_activity_at,
+                  new_contact_inbox.id AS contact_inbox_id
+                FROM selected_contact
+                JOIN new_contact_inbox ON new_contact_inbox.contact_id = selected_contact.contact_id
               ),
 
               new_conversation AS (
                 INSERT INTO conversations (account_id, inbox_id, status, contact_id,
                   contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
-                SELECT $1, $2, 0, new_contact_inbox.contact_id, new_contact_inbox.id, gen_random_uuid(),
-                  new_contact_inbox.updated_at, new_contact_inbox.created_at, new_contact_inbox.updated_at
-                FROM new_contact_inbox
-                RETURNING id, contact_id
+                SELECT
+                  $1,
+                  $2,
+                  0,
+                  selected_contact_inbox.contact_id,
+                  selected_contact_inbox.contact_inbox_id,
+                  gen_random_uuid(),
+                  to_timestamp(selected_contact_inbox.last_activity_at),
+                  to_timestamp(selected_contact_inbox.created_at),
+                  to_timestamp(selected_contact_inbox.last_activity_at)
+                FROM selected_contact_inbox
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM conversations existing_conversation
+                  WHERE existing_conversation.contact_inbox_id = selected_contact_inbox.contact_inbox_id
+                    AND existing_conversation.account_id = $1
+                    AND existing_conversation.inbox_id = $2
+                    AND existing_conversation.contact_id = selected_contact_inbox.contact_id
+                )
+                RETURNING id, contact_id, contact_inbox_id
+              ),
+
+              selected_conversation AS (
+                SELECT
+                  selected_contact_inbox.conversation_key,
+                  selected_contact_inbox.contact_id,
+                  conversations.id AS conversation_id
+                FROM selected_contact_inbox
+                JOIN conversations ON conversations.contact_inbox_id = selected_contact_inbox.contact_inbox_id
+                  AND conversations.account_id = $1
+                  AND conversations.inbox_id = $2
+                  AND conversations.contact_id = selected_contact_inbox.contact_id
+
+                UNION ALL
+
+                SELECT
+                  selected_contact_inbox.conversation_key,
+                  selected_contact_inbox.contact_id,
+                  new_conversation.id AS conversation_id
+                FROM selected_contact_inbox
+                JOIN new_conversation ON new_conversation.contact_inbox_id = selected_contact_inbox.contact_inbox_id
               )
 
-              SELECT seed.conversation_key, new_conversation.contact_id, new_conversation.id AS conversation_id
-              FROM new_conversation 
-              JOIN new_contact ON new_conversation.contact_id = new_contact.id
-              JOIN conversation_seed seed ON seed.identifier = new_contact.identifier
-
-              UNION
-
-              SELECT p.conversation_key, c.id contact_id, con.id conversation_id
-                FROM conversation_seed p
-              JOIN contacts c ON c.identifier = p.identifier
-              JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
-              JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
-                AND con.inbox_id = $2 AND con.contact_id = c.id`;
+              SELECT
+                selected_conversation.conversation_key,
+                selected_conversation.contact_id,
+                selected_conversation.conversation_id
+              FROM selected_conversation`;
 
     const fksFromChatwoot = await pgClient.query(sqlFromChatwoot, bindValues);
 
