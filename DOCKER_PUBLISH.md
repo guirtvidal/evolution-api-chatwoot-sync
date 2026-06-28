@@ -28,18 +28,18 @@ The API will be available on port `8080`; the embedded manager is served at `/ma
 
 ## Manual image publish
 
-The GitHub token currently available to this workspace does not include the `workflow` scope, so this import does not include GitHub Actions workflows.
+This fork is published on Docker Hub as `starttrust/evolution-api-chatwoot-sync`.
 
-To publish manually to GitHub Container Registry:
+To publish manually to Docker Hub:
 
 ```bash
-docker build -t ghcr.io/guirtvidal/evolution-api-chatwoot-sync:latest .
-docker login ghcr.io
-docker push ghcr.io/guirtvidal/evolution-api-chatwoot-sync:latest
+docker build -t starttrust/evolution-api-chatwoot-sync:latest .
+docker login
+docker push starttrust/evolution-api-chatwoot-sync:latest
 ```
 
 Image name:
 
 ```text
-ghcr.io/guirtvidal/evolution-api-chatwoot-sync
+starttrust/evolution-api-chatwoot-sync
 ```

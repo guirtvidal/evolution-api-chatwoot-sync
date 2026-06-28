@@ -15,7 +15,7 @@
   <a href="https://opensource.org/licenses/Apache-2.0"><img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="License: Apache 2.0" /></a>
   <a href="https://docs.evolutionfoundation.com.br"><img src="https://img.shields.io/badge/Docs-evolutionfoundation.com.br-00ffa7" alt="Documentation" /></a>
   <a href="https://evolutionfoundation.com.br/community"><img src="https://img.shields.io/badge/Community-Join%20us-white" alt="Community" /></a>
-  <a href="https://hub.docker.com/r/evoapicloud/evolution-api"><img src="https://img.shields.io/badge/Docker-evoapicloud-blue" alt="Docker image" /></a>
+  <a href="https://hub.docker.com/r/starttrust/evolution-api-chatwoot-sync"><img src="https://img.shields.io/badge/Docker-starttrust%2Fevolution--api--chatwoot--sync-blue" alt="Docker image" /></a>
 </p>
 
 <p align="center">
@@ -24,6 +24,33 @@
   <a href="https://evolutionfoundation.com.br/community">Community</a> &middot;
   <a href="mailto:suporte@evofoundation.com.br">Support</a>
 </p>
+
+---
+
+## Fork Notice
+
+This repository is a public fork/custom build of the original [evolution-foundation/evolution-api](https://github.com/evolution-foundation/evolution-api) project.
+
+It keeps the original Evolution API foundation and adds Start Trust specific fixes for Evolution API + Chatwoot synchronization.
+
+Docker Hub image:
+
+```bash
+docker pull starttrust/evolution-api-chatwoot-sync:latest
+```
+
+### Changes In This Fork
+
+- Added Docker publish support for the custom image `starttrust/evolution-api-chatwoot-sync`.
+- Added a manual Chatwoot import/sync endpoint and manager button.
+- Fixed Chatwoot contact import for WhatsApp groups so group contacts use the group name instead of the last sender name.
+- Fixed historical message import from Evolution API into Chatwoot for existing contacts, contact inboxes, and conversations.
+- Added Chatwoot contact/conversation upsert behavior so manual import updates existing contacts.
+- Added group-name synchronization before Chatwoot import using WhatsApp group metadata from `groupFetchAllParticipating()`.
+- Persisted resolved group names back into Evolution API local `Chat.name` and `Contact.pushName`.
+- Added safeguards around WhatsApp group metadata rate limits to avoid repeated `rate-overlimit` errors.
+- Fixed ambiguous SQL references in the Chatwoot import flow.
+- Kept ignored/system WhatsApp JIDs out of Chatwoot history import.
 
 ---
 
@@ -118,8 +145,8 @@ npm run start:prod
 ### Docker
 
 ```bash
-docker pull evoapicloud/evolution-api:latest
-docker run -p 8080:8080 --env-file .env evoapicloud/evolution-api:latest
+docker pull starttrust/evolution-api-chatwoot-sync:latest
+docker run -p 8080:8080 --env-file .env starttrust/evolution-api-chatwoot-sync:latest
 ```
 
 ---
