@@ -148,7 +148,9 @@ class ChatwootImport {
                           WHEN contacts.identifier LIKE '%@g.us'
                             AND (
                               EXCLUDED.name IS NULL
+                              OR TRIM(EXCLUDED.name) = ''
                               OR UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
+                              OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
                               OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1)
                               OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1) || ' (GROUP)'
                             )
@@ -470,7 +472,9 @@ class ChatwootImport {
                     WHEN contact.identifier LIKE '%@g.us'
                       AND (
                         EXCLUDED.name IS NULL
+                        OR TRIM(EXCLUDED.name) = ''
                         OR UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
+                        OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
                         OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1)
                         OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1) || ' (GROUP)'
                       )
@@ -692,10 +696,10 @@ class ChatwootImport {
   }
 
   private getGroupName(remoteJid: string, name?: string | null) {
-    const cleanName = name?.trim();
+    const cleanName = name?.replace(/\s*\(GROUP\)$/i, '').trim();
 
     if (cleanName && cleanName.toUpperCase() !== 'GROUP') {
-      return cleanName.endsWith('(GROUP)') ? cleanName : `${cleanName} (GROUP)`;
+      return `${cleanName} (GROUP)`;
     }
 
     return `${remoteJid.split('@')[0]} (GROUP)`;

@@ -4843,7 +4843,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private normalizeGroupSubject(name?: string | null) {
-    return name?.replace(/\s+\(GROUP\)$/i, '').trim() || '';
+    return name?.replace(/\s*\(GROUP\)$/i, '').trim() || '';
   }
 
   private isUsableGroupName(remoteJid: string, name?: string | null) {
@@ -4857,20 +4857,13 @@ export class BaileysStartupService extends ChannelStartupService {
       return candidateName || remoteJid?.split('@')[0] || '';
     }
 
-    const [chat, contact] = await Promise.all([
-      this.prismaRepository.chat.findFirst({
-        where: { instanceId: this.instanceId, remoteJid },
-        select: { name: true },
-      }),
-      this.prismaRepository.contact.findFirst({
-        where: { instanceId: this.instanceId, remoteJid },
-        select: { pushName: true },
-      }),
-    ]);
+    const chat = await this.prismaRepository.chat.findFirst({
+      where: { instanceId: this.instanceId, remoteJid },
+      select: { name: true },
+    });
 
-    const preservedName = [chat?.name, contact?.pushName].find((name) => this.isUsableGroupName(remoteJid, name));
-    if (preservedName) {
-      return this.normalizeGroupSubject(preservedName);
+    if (this.isUsableGroupName(remoteJid, chat?.name)) {
+      return this.normalizeGroupSubject(chat?.name);
     }
 
     if (this.isUsableGroupName(remoteJid, candidateName)) {

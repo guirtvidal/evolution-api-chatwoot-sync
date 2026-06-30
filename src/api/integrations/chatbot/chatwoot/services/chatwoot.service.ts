@@ -680,6 +680,15 @@ export class ChatwootService {
           this.logger.verbose(
             `Conversation exists: ID: ${conversationExists.id} - Name: ${conversationExists.meta.sender.name} - Identifier: ${conversationExists.meta.sender.identifier}`,
           );
+          if (isGroup) {
+            const storedGroupName = await this.getStoredGroupName(instance.instanceId, remoteJid);
+            const desiredGroupName = storedGroupName ? `${storedGroupName} (GROUP)` : null;
+            const sender = conversationExists?.meta?.sender;
+
+            if (desiredGroupName && sender?.id && sender?.name !== desiredGroupName) {
+              await this.updateContact(instance, sender.id, { name: desiredGroupName });
+            }
+          }
         } catch (error) {
           this.logger.error(`Error getting conversation: ${error}`);
           conversationExists = false;
@@ -793,7 +802,10 @@ export class ChatwootService {
               picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
             const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
             const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = !contact.name || contact.name === chatId;
+            const hasUsableGroupName = isGroup && this.isUsableGroupName(chatId, nameContact);
+            const nameNeedsUpdate = isGroup
+              ? hasUsableGroupName && contact.name !== nameContact
+              : !contact.name || contact.name === chatId;
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
             if (pictureNeedsUpdate || nameNeedsUpdate) {
@@ -2698,6 +2710,7 @@ export class ChatwootService {
       ...provider,
       ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
     };
+    const totalGroupContactsUpdated = await this.repairChatwootGroupContactNames(providerData, groupNamesByJid);
 
     if (provider.importMessages) {
       totalMessagesImported =
@@ -2715,6 +2728,7 @@ export class ChatwootService {
       contactsFound: contactsRaw.length,
       messagesFound: messagesRaw.length,
       groupsSynced: totalGroupsSynced,
+      groupContactsUpdated: totalGroupContactsUpdated,
       totalContactsImported: provider.importContacts
         ? totalContactsImported || contactsRaw.length
         : totalContactsImported,
@@ -2735,15 +2749,6 @@ export class ChatwootService {
     chatsRaw
       .filter((chat) => chat.remoteJid?.includes('@g.us') && this.isUsableGroupName(chat.remoteJid, chat.name))
       .forEach((chat) => groupNamesByJid.set(chat.remoteJid, this.normalizeGroupSubject(chat.name)));
-
-    contactsRaw
-      .filter(
-        (contact) =>
-          contact.remoteJid?.includes('@g.us') &&
-          !groupNamesByJid.has(contact.remoteJid) &&
-          this.isUsableGroupName(contact.remoteJid, contact.pushName),
-      )
-      .forEach((contact) => groupNamesByJid.set(contact.remoteJid, this.normalizeGroupSubject(contact.pushName)));
 
     chatsRaw
       .filter((chat) => chat.remoteJid?.includes('@g.us') && !groupNamesByJid.has(chat.remoteJid))
@@ -2834,8 +2839,38 @@ export class ChatwootService {
     );
   }
 
+  private async repairChatwootGroupContactNames(
+    provider: ChatwootDto,
+    groupNamesByJid: Map<string, string>,
+  ): Promise<number> {
+    const groups = Array.from(groupNamesByJid.entries())
+      .map(([remoteJid, name]) => ({ remoteJid, name: this.normalizeGroupSubject(name) }))
+      .filter((group) => this.isUsableGroupName(group.remoteJid, group.name));
+
+    if (groups.length === 0) {
+      return 0;
+    }
+
+    const pgClient = postgresClient.getChatwootConnection();
+    let totalUpdated = 0;
+
+    for (const group of groups) {
+      const result = await pgClient.query(
+        `UPDATE contacts
+          SET name = $1, updated_at = NOW()
+          WHERE account_id = $2
+            AND identifier = $3
+            AND COALESCE(name, '') <> $1`,
+        [`${group.name} (GROUP)`, provider.accountId, group.remoteJid],
+      );
+      totalUpdated += result?.rowCount ?? 0;
+    }
+
+    return totalUpdated;
+  }
+
   private normalizeGroupSubject(name?: string | null) {
-    return name?.replace(/\s+\(GROUP\)$/i, '').trim() || '';
+    return name?.replace(/\s*\(GROUP\)$/i, '').trim() || '';
   }
 
   private isUsableGroupName(remoteJid: string, name?: string | null) {
@@ -2845,19 +2880,12 @@ export class ChatwootService {
   }
 
   private async getStoredGroupName(instanceId: string, remoteJid: string): Promise<string | null> {
-    const [chat, contact] = await Promise.all([
-      this.prismaRepository.chat.findFirst({
-        where: { instanceId, remoteJid },
-        select: { name: true },
-      }),
-      this.prismaRepository.contact.findFirst({
-        where: { instanceId, remoteJid },
-        select: { pushName: true },
-      }),
-    ]);
+    const chat = await this.prismaRepository.chat.findFirst({
+      where: { instanceId, remoteJid },
+      select: { name: true },
+    });
 
-    const storedName = [chat?.name, contact?.pushName].find((name) => this.isUsableGroupName(remoteJid, name));
-    return storedName ? this.normalizeGroupSubject(storedName) : null;
+    return this.isUsableGroupName(remoteJid, chat?.name) ? this.normalizeGroupSubject(chat?.name) : null;
   }
 
   private prepareContactsForChatwootImport(
@@ -2882,9 +2910,6 @@ export class ChatwootService {
       const pushName =
         groupName ||
         (this.isUsableGroupName(remoteJid, chat?.name) ? this.normalizeGroupSubject(chat?.name) : null) ||
-        (this.isUsableGroupName(remoteJid, existingContact?.pushName)
-          ? this.normalizeGroupSubject(existingContact?.pushName)
-          : null) ||
         remoteJid.split('@')[0];
 
       contactsByJid.set(remoteJid, {
