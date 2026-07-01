@@ -272,10 +272,18 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async logoutInstance() {
+    this.endSession = true;
     this.messageProcessor.onDestroy();
-    await this.client?.logout('Log out instance: ' + this.instanceName);
+
+    try {
+      await this.client?.logout('Log out instance: ' + this.instanceName);
+    } catch (error) {
+      this.logger.warn(`Error while logging out instance ${this.instanceName}: ${error?.toString?.() || error}`);
+    }
 
     this.client?.ws?.close();
+    this.client?.end?.(new Error('logout'));
+    this.stateConnection = { state: 'close' };
 
     const db = this.configService.get<Database>('DATABASE');
     const cache = this.configService.get<CacheConf>('CACHE');
@@ -303,6 +311,14 @@ export class BaileysStartupService extends ChannelStartupService {
     if (sessionExists) {
       await this.prismaRepository.session.delete({ where: { sessionId: this.instanceId } });
     }
+
+    await this.prismaRepository.instance.update({
+      where: { id: this.instanceId },
+      data: {
+        connectionStatus: 'close',
+        disconnectionAt: new Date(),
+      },
+    });
   }
 
   public async getProfileName() {
