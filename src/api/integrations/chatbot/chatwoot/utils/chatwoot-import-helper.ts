@@ -145,19 +145,38 @@ class ChatwootImport {
         sqlInsert += ` ON CONFLICT (identifier, account_id)
                        DO UPDATE SET
                         name = CASE
-                          WHEN contacts.identifier LIKE '%@g.us'
+                          WHEN contacts.name IS NOT NULL
+                            AND TRIM(contacts.name) <> ''
+                            AND UPPER(TRIM(contacts.name)) NOT IN ('GROUP', '(GROUP)')
+                            AND TRIM(contacts.name) <> SPLIT_PART(contacts.identifier, '@', 1)
+                            AND TRIM(contacts.name) <> SPLIT_PART(contacts.identifier, '@', 1) || ' (GROUP)'
+                            AND TRIM(contacts.name) <> COALESCE(contacts.phone_number, '')
+                            AND TRIM(contacts.name) !~ '^\\+?[0-9]+$'
                             AND (
-                              EXCLUDED.name IS NULL
-                              OR TRIM(EXCLUDED.name) = ''
-                              OR UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
-                              OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
-                              OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1)
-                              OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1) || ' (GROUP)'
+                              contacts.identifier NOT LIKE '%@g.us'
+                              OR TRIM(contacts.name) ILIKE '% (GROUP)'
+                            )
+                          THEN contacts.name
+                          WHEN EXCLUDED.name IS NULL
+                            OR TRIM(EXCLUDED.name) = ''
+                            OR (
+                              contacts.identifier LIKE '%@g.us'
+                              AND (
+                                UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
+                                OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
+                                OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1)
+                                OR TRIM(EXCLUDED.name) = SPLIT_PART(contacts.identifier, '@', 1) || ' (GROUP)'
+                              )
                             )
                           THEN contacts.name
                           ELSE EXCLUDED.name
                         END,
-                        phone_number = EXCLUDED.phone_number,
+                        phone_number = CASE
+                          WHEN contacts.phone_number IS NOT NULL
+                            AND TRIM(contacts.phone_number) <> ''
+                          THEN contacts.phone_number
+                          ELSE EXCLUDED.phone_number
+                        END,
                         updated_at = NOW()`;
 
         totalContactsImported += (await pgClient.query(sqlInsert, bindInsert))?.rowCount ?? 0;
@@ -469,19 +488,38 @@ class ChatwootImport {
                 FROM conversation_seed
                 ON CONFLICT(identifier, account_id) DO UPDATE SET
                   name = CASE
-                    WHEN contact.identifier LIKE '%@g.us'
+                    WHEN contact.name IS NOT NULL
+                      AND TRIM(contact.name) <> ''
+                      AND UPPER(TRIM(contact.name)) NOT IN ('GROUP', '(GROUP)')
+                      AND TRIM(contact.name) <> SPLIT_PART(contact.identifier, '@', 1)
+                      AND TRIM(contact.name) <> SPLIT_PART(contact.identifier, '@', 1) || ' (GROUP)'
+                      AND TRIM(contact.name) <> COALESCE(contact.phone_number, '')
+                      AND TRIM(contact.name) !~ '^\\+?[0-9]+$'
                       AND (
-                        EXCLUDED.name IS NULL
-                        OR TRIM(EXCLUDED.name) = ''
-                        OR UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
-                        OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
-                        OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1)
-                        OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1) || ' (GROUP)'
+                        contact.identifier NOT LIKE '%@g.us'
+                        OR TRIM(contact.name) ILIKE '% (GROUP)'
+                      )
+                    THEN contact.name
+                    WHEN EXCLUDED.name IS NULL
+                      OR TRIM(EXCLUDED.name) = ''
+                      OR (
+                        contact.identifier LIKE '%@g.us'
+                        AND (
+                          UPPER(TRIM(EXCLUDED.name)) = 'GROUP'
+                          OR UPPER(TRIM(EXCLUDED.name)) = '(GROUP)'
+                          OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1)
+                          OR TRIM(EXCLUDED.name) = SPLIT_PART(contact.identifier, '@', 1) || ' (GROUP)'
+                        )
                       )
                     THEN contact.name
                     ELSE EXCLUDED.name
                   END,
-                  phone_number = EXCLUDED.phone_number,
+                  phone_number = CASE
+                    WHEN contact.phone_number IS NOT NULL
+                      AND TRIM(contact.phone_number) <> ''
+                    THEN contact.phone_number
+                    ELSE EXCLUDED.phone_number
+                  END,
                   updated_at = EXCLUDED.updated_at
                 RETURNING contact.id, contact.identifier, contact.created_at, contact.updated_at
               ),

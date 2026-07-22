@@ -157,6 +157,7 @@ import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
+  remoteJidLid?: string;
   participantAlt?: string;
   server_id?: string;
   isViewOnce?: boolean;
@@ -259,7 +260,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly UPDATE_CACHE_TTL_SECONDS = 30 * 60; // 30 minutes - avoid duplicate status updates
   private readonly HISTORY_GAP_SECONDS = 10 * 60; // 10 minutes - request recent history when a chat jumps ahead
   private readonly HISTORY_GAP_SYNC_TTL_SECONDS = 15 * 60; // 15 minutes - avoid Baileys/WhatsApp rate limits
-  private readonly HISTORY_GAP_GLOBAL_TTL_SECONDS = 10; // Pace cross-chat history requests
+  private readonly HISTORY_GAP_GLOBAL_TTL_SECONDS = 60; // Pace cross-chat history requests
   private readonly HISTORY_GAP_SYNC_MESSAGE_COUNT = 50;
   private readonly MAX_RECONNECT_DELAY_MS = 30_000;
 
@@ -996,9 +997,9 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.verbose(`Received on-demand history sync with ${messages.length} message(s)`);
         }
-        console.log(
+        this.logger.verbose(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
@@ -1163,27 +1164,32 @@ export class BaileysStartupService extends ChannelStartupService {
             if (text == 'requestPlaceholder' && !requestId) {
               const messageId = await this.client.requestPlaceholderResend(received.key);
 
-              console.log('requested placeholder resync, id=', messageId);
+              this.logger.verbose(`Requested placeholder resync, id=${messageId}`);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.verbose(`Message received from phone, id=${requestId}`);
             }
 
             if (text == 'onDemandHistSync') {
               const messageId = await this.client.fetchMessageHistory(50, received.key, received.messageTimestamp!);
-              console.log('requested on-demand sync, id=', messageId);
+              this.logger.verbose(`Requested on-demand sync, id=${messageId}`);
             }
           }
 
-          const editedMessage =
+          const protocolMessage =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const editedMessage = protocolMessage?.editedMessage ? protocolMessage : null;
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-              this.chatwootService.eventWhatsapp(
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+              this.logger.info(
+                `[CW.EDIT] Forwarding edited WhatsApp message originalId=${editedMessage.key?.id} instanceId=${this.instanceId}`,
+              );
+              await this.chatwootService.eventWhatsapp(
                 'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instance.id },
+                { instanceName: this.instance.name, instanceId: this.instanceId },
                 editedMessage,
               );
+            }
 
             await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
 
@@ -1230,7 +1236,9 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          await this.requestRecentHistoryOnGap(received);
+          if (type === 'notify') {
+            await this.requestRecentHistoryOnGap(received);
+          }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: received.key.remoteJid },
@@ -1565,9 +1573,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
           sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
           if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+            messageRaw.key.remoteJidLid = messageRaw.key.remoteJid;
             messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
           }
-          console.log(messageRaw);
 
           this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
@@ -1605,12 +1613,17 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contactRaw.remoteJid.includes('@s.whatsapp') || contactRaw.remoteJid.includes('@lid')) {
+            const isLidMessage = messageRaw.key.addressingMode === 'lid';
+            const cacheRemoteJid =
+              isLidMessage && messageRaw.key.remoteJidAlt ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid;
+            const cacheRemoteJidAlt =
+              isLidMessage && received.key.remoteJid?.includes('@lid') ? received.key.remoteJid : undefined;
+
             await saveOnWhatsappCache([
               {
-                remoteJid:
-                  messageRaw.key.addressingMode === 'lid' ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid,
-                remoteJidAlt: messageRaw.key.remoteJidAlt,
-                lid: messageRaw.key.addressingMode === 'lid' ? 'lid' : null,
+                remoteJid: cacheRemoteJid,
+                remoteJidAlt: cacheRemoteJidAlt,
+                lid: isLidMessage ? 'lid' : null,
               },
             ]);
           }
@@ -1622,7 +1635,13 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.chatwootService.eventWhatsapp(
                 Events.CONTACTS_UPDATE,
                 { instanceName: this.instance.name, instanceId: this.instanceId },
-                contactRaw,
+                {
+                  ...contactRaw,
+                  remoteJidAlt:
+                    messageRaw.key.remoteJid !== received.key.remoteJid
+                      ? messageRaw.key.remoteJid
+                      : received.key.remoteJidAlt,
+                },
               );
             }
 
@@ -1644,6 +1663,20 @@ export class BaileysStartupService extends ChannelStartupService {
               update: contactRaw,
               create: contactRaw,
             });
+
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            await this.chatwootService.eventWhatsapp(
+              Events.CONTACTS_UPSERT,
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              {
+                ...contactRaw,
+                remoteJidAlt:
+                  messageRaw.key.remoteJid !== received.key.remoteJid
+                    ? messageRaw.key.remoteJid
+                    : received.key.remoteJidAlt,
+              },
+            );
+          }
         }
       } catch (error) {
         this.logger.error(error);
@@ -1660,12 +1693,21 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
+        const updateType =
+          update.status != null ? String(update.status) : Object.keys(update).sort().join(',') || 'unknown';
+        const updateKey = `${this.instance.id}_${key.id}_${updateType}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
+        this.logger.verbose(
+          `Message update cache: ${JSON.stringify({
+            cached,
+            updateKey,
+            messageTimestamp: update.messageTimestamp,
+            secondsSinceEpoch,
+          })}`,
+        );
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -3600,6 +3642,52 @@ export class BaileysStartupService extends ChannelStartupService {
 
   // Chat Controller
   public async whatsappNumber(data: WhatsAppNumberDto) {
+    const getUserJidOptions = (number: string, jid: string) => {
+      const jidOptions = new Set<string>([jid.replace('+', '')]);
+
+      if (jid.includes('@lid')) {
+        return [...jidOptions];
+      }
+
+      const rawNumber = number
+        ?.replace(/\s/g, '')
+        .replace(/\+/g, '')
+        .replace(/\(/g, '')
+        .replace(/\)/g, '')
+        .split(':')[0]
+        .split('@')[0]
+        .replace(/\D/g, '');
+      const jidNumber = jid.split('@')[0].replace(/\D/g, '');
+      const normalizedNumber = rawNumber || jidNumber;
+
+      if (normalizedNumber.startsWith('55')) {
+        const numberWithDigit =
+          normalizedNumber.slice(4, 5) === '9' && normalizedNumber.length === 13
+            ? normalizedNumber
+            : `${normalizedNumber.slice(0, 4)}9${normalizedNumber.slice(4)}`;
+        const numberWithoutDigit =
+          normalizedNumber.length === 12 ? normalizedNumber : normalizedNumber.slice(0, 4) + normalizedNumber.slice(5);
+
+        jidOptions.add(`${numberWithDigit}@s.whatsapp.net`);
+        jidOptions.add(`${numberWithoutDigit}@s.whatsapp.net`);
+      }
+
+      if (normalizedNumber.startsWith('52') || normalizedNumber.startsWith('54')) {
+        const prefix = normalizedNumber.startsWith('52') ? '1' : '9';
+        const numberWithDigit =
+          normalizedNumber.slice(2, 3) === prefix && normalizedNumber.length === 13
+            ? normalizedNumber
+            : `${normalizedNumber.slice(0, 2)}${prefix}${normalizedNumber.slice(2)}`;
+        const numberWithoutDigit =
+          normalizedNumber.length === 12 ? normalizedNumber : normalizedNumber.slice(0, 2) + normalizedNumber.slice(3);
+
+        jidOptions.add(`${numberWithDigit}@s.whatsapp.net`);
+        jidOptions.add(`${numberWithoutDigit}@s.whatsapp.net`);
+      }
+
+      return [...jidOptions];
+    };
+
     const jids: {
       groups: { number: string; jid: string }[];
       broadcast: { number: string; jid: string }[];
@@ -3642,8 +3730,13 @@ export class BaileysStartupService extends ChannelStartupService {
       where: { instanceId: this.instanceId, remoteJid: { in: jids.users.map(({ jid }) => jid) } },
     });
 
-    // Unified cache verification for all numbers (normal and LID)
-    const numbersToVerify = jids.users.map(({ jid }) => jid.replace('+', ''));
+    const userJidOptions = new Map<string, string[]>();
+    jids.users.forEach((user) => {
+      userJidOptions.set(user.jid, getUserJidOptions(user.number, user.jid));
+    });
+
+    // Unified cache verification for all number candidates (normal and LID)
+    const numbersToVerify = [...new Set([...userJidOptions.values()].flat())];
 
     // Get all numbers from cache
     const cachedNumbers = await getOnWhatsappCache(numbersToVerify);
@@ -3663,8 +3756,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const verifiedUsers = await Promise.all(
       jids.users.map(async (user) => {
+        const jidOptions = userJidOptions.get(user.jid) || [user.jid.replace('+', '')];
+
         // Try to get from cache first (works for all: normal and LID)
-        const cached = cachedNumbers.find((cached) => cached.jidOptions.includes(user.jid.replace('+', '')));
+        const cached = cachedNumbers.find((cached) => jidOptions.some((jid) => cached.jidOptions.includes(jid)));
 
         if (cached) {
           this.logger.verbose(`Number ${user.number} found in cache`);
@@ -3689,48 +3784,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         // If not in cache and is a normal number, use Baileys verification
-        let numberVerified: (typeof verify)[0] | null = null;
-
-        // Brazilian numbers
-        if (user.number.startsWith('55')) {
-          const numberWithDigit =
-            user.number.slice(4, 5) === '9' && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 4)}9${user.number.slice(4)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 4) + user.number.slice(5);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        // Mexican/Argentina numbers
-        // Ref: https://faq.whatsapp.com/1294841057948784
-        if (!numberVerified && (user.number.startsWith('52') || user.number.startsWith('54'))) {
-          let prefix = '';
-          if (user.number.startsWith('52')) {
-            prefix = '1';
-          }
-          if (user.number.startsWith('54')) {
-            prefix = '9';
-          }
-
-          const numberWithDigit =
-            user.number.slice(2, 3) === prefix && user.number.length === 13
-              ? user.number
-              : `${user.number.slice(0, 2)}${prefix}${user.number.slice(2)}`;
-          const numberWithoutDigit =
-            user.number.length === 12 ? user.number : user.number.slice(0, 2) + user.number.slice(3);
-
-          numberVerified = verify.find(
-            (v) => v.jid === `${numberWithDigit}@s.whatsapp.net` || v.jid === `${numberWithoutDigit}@s.whatsapp.net`,
-          );
-        }
-
-        if (!numberVerified) {
-          numberVerified = verify.find((v) => v.jid === user.jid);
-        }
+        const numberVerified = verify.find((v) => jidOptions.includes(v.jid) && v.exists);
 
         const numberJid = numberVerified?.jid || user.jid;
 
@@ -5100,7 +5154,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async baileysSendNode(stanza: any) {
-    console.log('stanza', JSON.stringify(stanza));
+    this.logger.verbose(`Sending Baileys node with tag=${stanza?.tag || 'unknown'}`);
     const response = await this.client.sendNode(stanza);
 
     return response;

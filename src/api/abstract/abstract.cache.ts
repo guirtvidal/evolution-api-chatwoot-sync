@@ -3,7 +3,9 @@ export interface ICache {
 
   hGet(key: string, field: string): Promise<any>;
 
-  set(key: string, value: any, ttl?: number): void;
+  set(key: string, value: any, ttl?: number): Promise<any>;
+
+  setIfNotExists(key: string, value: any, ttl?: number): Promise<boolean>;
 
   hSet(key: string, field: string, value: any): Promise<void>;
 

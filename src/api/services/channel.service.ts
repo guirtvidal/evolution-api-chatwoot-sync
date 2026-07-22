@@ -157,6 +157,8 @@ export class ChannelStartupService {
   }
 
   public async setSettings(data: SettingsDto) {
+    const shouldReloadForFullSync = this.localSettings.syncFullHistory !== data.syncFullHistory;
+
     await this.prismaRepository.setting.upsert({
       where: {
         instanceId: this.instanceId,
@@ -193,7 +195,7 @@ export class ChannelStartupService {
     this.localSettings.syncFullHistory = data?.syncFullHistory;
     this.localSettings.wavoipToken = data?.wavoipToken;
 
-    if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
+    if ((shouldReloadForFullSync || this.localSettings.wavoipToken?.length > 0) && this.client?.ws) {
       this.client.ws.close();
       this.client.ws.connect();
     }

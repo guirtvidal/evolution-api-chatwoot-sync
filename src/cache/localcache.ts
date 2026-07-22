@@ -24,6 +24,15 @@ export class LocalCache implements ICache {
     return LocalCache.localCache.set(this.buildKey(key), value, ttl || this.conf.TTL);
   }
 
+  async setIfNotExists(key: string, value: any, ttl?: number): Promise<boolean> {
+    const cacheKey = this.buildKey(key);
+    if (LocalCache.localCache.has(cacheKey)) {
+      return false;
+    }
+
+    return LocalCache.localCache.set(cacheKey, value, ttl || this.conf.TTL);
+  }
+
   async has(key: string) {
     return LocalCache.localCache.has(this.buildKey(key));
   }

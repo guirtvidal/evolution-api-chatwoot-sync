@@ -1,5 +1,8 @@
 FROM node:24-alpine AS builder
 
+ARG NODE_OPTIONS
+ENV HUSKY=0
+
 RUN apk update && \
     apk add --no-cache git ffmpeg wget curl bash openssl dos2unix
 
