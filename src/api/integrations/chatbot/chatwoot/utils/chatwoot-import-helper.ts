@@ -301,6 +301,25 @@ class ChatwootImport {
         return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
+      const existingSourceIds = await this.getExistingSourceIds(
+        messagesOrdered.map((message: any) => message.key.id),
+        { accountId: provider.accountId, inboxId: inbox.id },
+      );
+      const messagesBeforeFiltering = messagesOrdered.length;
+      messagesOrdered = messagesOrdered.filter(
+        (message: any) =>
+          !existingSourceIds.has(message.key.id) &&
+          !this.isEditedOrProtocolMessage(message) &&
+          !!this.getContentMessage(chatwootService, message),
+      );
+
+      const skippedMessages = messagesBeforeFiltering - messagesOrdered.length;
+      if (skippedMessages > 0) {
+        this.logger.warn(
+          `[CW.IMPORT] Skipped ${skippedMessages} duplicate, edited, protocol, or empty message(s) before creating conversations`,
+        );
+      }
+
       const allMessagesMappedByConversation = this.createMessagesMapByConversation(messagesOrdered);
       // Map structure: +552199999999 or 120363...@g.us => { first message timestamp, last message timestamp}
       const conversationsWithTimestamp = new Map<string, firstLastTimestamp>();
@@ -311,11 +330,6 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(
-        messagesOrdered.map((message: any) => message.key.id),
-        { accountId: provider.accountId, inboxId: inbox.id },
-      );
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -763,6 +777,46 @@ class ChatwootImport {
     } catch (error) {
       this.logger.error(`Error on get recent conversations: ${error.toString()}`);
     }
+  }
+
+  private isEditedOrProtocolMessage(message: Message): boolean {
+    const messageRecord = message as Message & {
+      status?: string | null;
+      messageType?: string | null;
+      message?: Record<string, any> | null;
+    };
+    const status = messageRecord.status?.toUpperCase();
+    const messageType = messageRecord.messageType?.toLowerCase();
+
+    if (status === 'EDITED' || messageType === 'editedmessage' || messageType === 'protocolmessage') {
+      return true;
+    }
+
+    let content = messageRecord.message;
+    for (let depth = 0; depth < 6 && content; depth++) {
+      const protocolMessage = content.protocolMessage;
+      const protocolType = protocolMessage?.type;
+      if (
+        protocolMessage?.editedMessage ||
+        protocolType === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT ||
+        protocolType === 'MESSAGE_EDIT'
+      ) {
+        return true;
+      }
+
+      if (content.editedMessage) {
+        return true;
+      }
+
+      content =
+        content.ephemeralMessage?.message ||
+        content.viewOnceMessage?.message ||
+        content.viewOnceMessageV2?.message ||
+        content.viewOnceMessageV2Extension?.message ||
+        content.documentWithCaptionMessage?.message;
+    }
+
+    return false;
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {

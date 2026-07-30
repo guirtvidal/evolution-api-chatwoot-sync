@@ -91,7 +91,9 @@ import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-fil
 import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-redis-db';
 import axios from 'axios';
 import makeWASocket, {
+  aesDecryptGCM,
   AnyMessageContent,
+  BaileysEventMap,
   BufferedEventData,
   BufferJSON,
   CacheStore,
@@ -110,6 +112,7 @@ import makeWASocket, {
   getContentType,
   getDevice,
   GroupMetadata,
+  hkdf,
   isJidBroadcast,
   isJidGroup,
   isJidNewsletter,
@@ -979,6 +982,347 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private async forwardEditedMessageToChatwoot(
+    event: 'messages.edit' | 'send.message.update',
+    key: WAMessageKey,
+    editedMessage: proto.IMessage,
+    source: string,
+  ): Promise<boolean> {
+    if (!key?.id || !editedMessage) {
+      this.logger.warn(`[CW.EDIT] Invalid edited message received from ${source}`);
+      return false;
+    }
+
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED || !this.localChatwoot?.enabled) {
+      return false;
+    }
+
+    if (!this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+      this.logger.warn(
+        `[CW.EDIT] DATABASE_SAVE_DATA_NEW_MESSAGE=false; Evolution chat history cannot persist whatsappId=${key.id}`,
+      );
+    }
+
+    const contentHash = createHash('sha256')
+      .update(proto.Message.encode(editedMessage).finish())
+      .digest('hex')
+      .slice(0, 16);
+    const cacheKey = `chatwoot_edit_${this.instanceId}_${key.id}_${contentHash}`;
+    const reserved = await this.baileysCache.setIfNotExists(cacheKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+
+    if (!reserved) {
+      this.logger.verbose(`[CW.EDIT] Duplicate edit ignored whatsappId=${key.id} source=${source}`);
+      return true;
+    }
+
+    let updated = false;
+
+    try {
+      this.logger.info(
+        `[CW.EDIT] Forwarding edited WhatsApp message whatsappId=${key.id} source=${source} instanceId=${this.instanceId}`,
+      );
+      const result = await this.chatwootService.eventWhatsapp(
+        event,
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        {
+          key,
+          editedMessage: {
+            message: editedMessage,
+          },
+        },
+      );
+
+      updated = !!result;
+      if (!updated) {
+        this.logger.warn(`[CW.EDIT] Chatwoot did not update message whatsappId=${key.id} source=${source}`);
+      }
+
+      return updated;
+    } catch (error) {
+      const errorDetails = error instanceof Error ? error.stack || error.message : JSON.stringify(error);
+      this.logger.error(
+        `[CW.EDIT] Failed forwarding edited message whatsappId=${key.id} source=${source}: ${errorDetails}`,
+      );
+      return false;
+    } finally {
+      if (!updated) {
+        await this.baileysCache.delete(cacheKey);
+      }
+    }
+  }
+
+  private extractEditedMessage(
+    message: proto.IMessage | null | undefined,
+    fallbackKey: WAMessageKey,
+  ): { key: WAMessageKey; message: proto.IMessage } | null {
+    let currentMessage = message;
+
+    for (let depth = 0; depth < 6 && currentMessage; depth++) {
+      const protocolMessage = currentMessage.protocolMessage;
+      if (protocolMessage?.editedMessage) {
+        const protocolKey = protocolMessage.key || {};
+        return {
+          key: {
+            ...fallbackKey,
+            ...protocolKey,
+            id: protocolKey.id || fallbackKey.id,
+            remoteJid: protocolKey.remoteJid || fallbackKey.remoteJid,
+            fromMe: protocolKey.fromMe ?? fallbackKey.fromMe,
+            participant: protocolKey.participant || fallbackKey.participant,
+          },
+          message: this.attachMessageSecret(protocolMessage.editedMessage, currentMessage),
+        };
+      }
+
+      const editedMessage = currentMessage.editedMessage?.message;
+      if (editedMessage) {
+        if (editedMessage.protocolMessage) {
+          currentMessage = editedMessage;
+          continue;
+        }
+
+        return {
+          key: fallbackKey,
+          message: this.attachMessageSecret(editedMessage, currentMessage),
+        };
+      }
+
+      currentMessage =
+        currentMessage.ephemeralMessage?.message ||
+        currentMessage.viewOnceMessage?.message ||
+        currentMessage.viewOnceMessageV2?.message ||
+        currentMessage.viewOnceMessageV2Extension?.message ||
+        currentMessage.documentWithCaptionMessage?.message;
+    }
+
+    return null;
+  }
+
+  private attachMessageSecret(
+    message: proto.IMessage,
+    ...sources: Array<proto.IMessage | null | undefined>
+  ): proto.IMessage {
+    const messageSecret =
+      this.toMessageBuffer(message?.messageContextInfo?.messageSecret) ||
+      sources
+        .map((source) => this.toMessageBuffer(source?.messageContextInfo?.messageSecret))
+        .find((secret): secret is Buffer => Boolean(secret));
+
+    if (!messageSecret) {
+      return message;
+    }
+
+    return {
+      ...message,
+      messageContextInfo: {
+        ...message.messageContextInfo,
+        messageSecret,
+      },
+    };
+  }
+
+  private toMessageBuffer(value: unknown): Buffer | null {
+    if (!value) {
+      return null;
+    }
+
+    if (Buffer.isBuffer(value)) {
+      return value;
+    }
+
+    if (value instanceof Uint8Array) {
+      return Buffer.from(value);
+    }
+
+    if (typeof value === 'string') {
+      try {
+        return Buffer.from(value, 'base64');
+      } catch {
+        return null;
+      }
+    }
+
+    if (Array.isArray(value)) {
+      return Buffer.from(value);
+    }
+
+    if (typeof value === 'object') {
+      const objectValue = value as Record<string, unknown>;
+      if (Array.isArray(objectValue.data)) {
+        return Buffer.from(objectValue.data);
+      }
+
+      const indexedKeys = Object.keys(objectValue).filter((key) => /^\d+$/.test(key));
+      if (indexedKeys.length) {
+        return Buffer.from(
+          indexedKeys.sort((left, right) => Number(left) - Number(right)).map((key) => Number(objectValue[key])),
+        );
+      }
+    }
+
+    return null;
+  }
+
+  private normalizeMessageSecretJid(jid: string | null | undefined): string | null {
+    if (!jid) {
+      return null;
+    }
+
+    const normalized = jidNormalizedUser(jid);
+    return normalized || null;
+  }
+
+  private getUniqueMessageSecretJids(...jids: Array<string | null | undefined>): string[] {
+    return [
+      ...new Set(jids.map((jid) => this.normalizeMessageSecretJid(jid)).filter((jid): jid is string => Boolean(jid))),
+    ];
+  }
+
+  private async decryptSecretEncryptedEdit(
+    message: proto.IMessage | null | undefined,
+    fallbackKey: WAMessageKey,
+  ): Promise<{ key: WAMessageKey; message: proto.IMessage } | null> {
+    const secretEnvelope = message?.secretEncryptedMessage;
+    if (
+      !secretEnvelope ||
+      secretEnvelope.secretEncType !== proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT
+    ) {
+      return null;
+    }
+
+    const targetKey = secretEnvelope.targetMessageKey;
+    const targetMessageId = targetKey?.id;
+    if (!targetMessageId) {
+      this.logger.warn(`[CW.EDIT] Secret edit has no target message id envelope=${fallbackKey?.id || 'unknown'}`);
+      return null;
+    }
+
+    const storedMessage = (await this.getMessage(targetKey, true)) as any;
+    const messageSecret = this.toMessageBuffer(
+      storedMessage?.message?.messageContextInfo?.messageSecret ||
+        storedMessage?.messageSecret ||
+        storedMessage?.contextInfo?.messageSecret,
+    );
+    const encryptedPayload = this.toMessageBuffer(secretEnvelope.encPayload);
+    const encryptedIv = this.toMessageBuffer(secretEnvelope.encIv);
+
+    if (!storedMessage?.message) {
+      this.logger.warn(
+        `[CW.EDIT] Cannot decrypt secret edit because original message is not stored envelope=${
+          fallbackKey?.id || 'unknown'
+        } target=${targetMessageId}`,
+      );
+      return null;
+    }
+
+    if (!messageSecret || !encryptedPayload || !encryptedIv) {
+      this.logger.warn(
+        `[CW.EDIT] Cannot decrypt secret edit due to missing cryptographic data envelope=${
+          fallbackKey?.id || 'unknown'
+        } target=${targetMessageId} messageSecret=${Boolean(messageSecret)} payload=${Boolean(
+          encryptedPayload,
+        )} iv=${Boolean(encryptedIv)}`,
+      );
+      return null;
+    }
+
+    const envelopeKey = fallbackKey as ExtendedIMessageKey;
+    const storedKey = (storedMessage.key || {}) as ExtendedIMessageKey;
+    const extendedTargetKey = targetKey as ExtendedIMessageKey;
+    const ownJid = this.instance.wuid;
+
+    const modificationSenders = fallbackKey.fromMe
+      ? this.getUniqueMessageSecretJids(ownJid, this.client?.user?.id, this.client?.user?.lid)
+      : this.getUniqueMessageSecretJids(
+          envelopeKey.participant,
+          envelopeKey.participantAlt,
+          envelopeKey.remoteJidLid,
+          envelopeKey.remoteJidAlt,
+          envelopeKey.remoteJid,
+        );
+
+    const originalSenders = targetKey.fromMe
+      ? this.getUniqueMessageSecretJids(
+          ownJid,
+          this.client?.user?.id,
+          this.client?.user?.lid,
+          storedKey.participant,
+          storedKey.participantAlt,
+          storedKey.remoteJidLid,
+          storedKey.remoteJidAlt,
+          storedKey.remoteJid,
+        )
+      : this.getUniqueMessageSecretJids(
+          extendedTargetKey.participant,
+          extendedTargetKey.participantAlt,
+          extendedTargetKey.remoteJidLid,
+          extendedTargetKey.remoteJidAlt,
+          extendedTargetKey.remoteJid,
+          storedKey.participant,
+          storedKey.participantAlt,
+          storedKey.remoteJidLid,
+          storedKey.remoteJidAlt,
+          storedKey.remoteJid,
+        );
+
+    for (const modificationSender of modificationSenders) {
+      for (const originalSender of originalSenders) {
+        try {
+          const keyInfo = `${targetMessageId}${originalSender}${modificationSender}Message Edit`;
+          const decryptionKey = await hkdf(messageSecret, 32, { info: keyInfo });
+          const plaintext = aesDecryptGCM(encryptedPayload, decryptionKey, encryptedIv, Buffer.alloc(0));
+          const decryptedMessage = proto.Message.decode(plaintext);
+          const editedMessage = this.extractEditedMessage(decryptedMessage, {
+            ...fallbackKey,
+            ...targetKey,
+            id: targetMessageId,
+            remoteJid: targetKey.remoteJid || fallbackKey.remoteJid,
+            fromMe: targetKey.fromMe ?? fallbackKey.fromMe,
+            participant: targetKey.participant || fallbackKey.participant,
+          });
+
+          if (!editedMessage) {
+            continue;
+          }
+
+          const editedMessageWithSecret = {
+            ...editedMessage,
+            message: this.attachMessageSecret(
+              editedMessage.message,
+              decryptedMessage,
+              storedMessage.message as proto.IMessage,
+            ),
+          };
+
+          this.logger.info(
+            `[CW.EDIT] Decrypted secret WhatsApp edit envelope=${
+              fallbackKey?.id || 'unknown'
+            } target=${targetMessageId} modificationSender=${modificationSender} originalSender=${originalSender}`,
+          );
+          return editedMessageWithSecret;
+        } catch {
+          // LID migrations can make either sender appear as PN or LID. Try all known, authenticated combinations.
+        }
+      }
+    }
+
+    this.logger.warn(
+      `[CW.EDIT] Failed to decrypt secret WhatsApp edit envelope=${
+        fallbackKey?.id || 'unknown'
+      } target=${targetMessageId} modificationSenders=${modificationSenders.join(',') || 'none'} originalSenders=${
+        originalSenders.join(',') || 'none'
+      }`,
+    );
+    return null;
+  }
+
+  private async extractEditedMessageForEvent(
+    message: proto.IMessage | null | undefined,
+    fallbackKey: WAMessageKey,
+  ): Promise<{ key: WAMessageKey; message: proto.IMessage } | null> {
+    return this.extractEditedMessage(message, fallbackKey) || this.decryptSecretEncryptedEdit(message, fallbackKey);
+  }
+
   private readonly messageHandle = {
     'messaging-history.set': async ({
       messages,
@@ -1175,23 +1519,20 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const protocolMessage =
-            received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
-          const editedMessage = protocolMessage?.editedMessage ? protocolMessage : null;
+          const editedMessage = await this.extractEditedMessageForEvent(received?.message, received.key);
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-              this.logger.info(
-                `[CW.EDIT] Forwarding edited WhatsApp message originalId=${editedMessage.key?.id} instanceId=${this.instanceId}`,
-              );
-              await this.chatwootService.eventWhatsapp(
-                'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instanceId },
-                editedMessage,
-              );
-            }
+            await this.forwardEditedMessageToChatwoot(
+              'messages.edit',
+              editedMessage.key,
+              editedMessage.message,
+              'messages.upsert',
+            );
 
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
+            await this.sendDataWebhook(Events.MESSAGES_EDITED, {
+              key: editedMessage.key,
+              editedMessage: editedMessage.message,
+            });
 
             if (received.key?.id && editedMessage.key?.id) {
               await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
@@ -1202,11 +1543,15 @@ export class BaileysStartupService extends ChannelStartupService {
               const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
                 ? Math.floor(received?.messageTimestamp.toNumber())
                 : Math.floor(received?.messageTimestamp as number);
+              const persistedEditedMessage = this.attachMessageSecret(
+                editedMessage.message,
+                (oldMessage as any).message as proto.IMessage,
+              );
 
               await this.prismaRepository.message.update({
                 where: { id: (oldMessage as any).id },
                 data: {
-                  message: editedMessage.editedMessage as any,
+                  message: persistedEditedMessage as any,
                   messageTimestamp: editedMessageTimestamp,
                   status: 'EDITED',
                 },
@@ -1267,6 +1612,24 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+          const isUnparsedEditedMessage =
+            messageRaw.status === 'EDITED' ||
+            messageRaw.messageType === 'editedMessage' ||
+            (messageRaw.messageType === 'secretEncryptedMessage' &&
+              messageRaw.message?.secretEncryptedMessage?.secretEncType ===
+                proto.Message.SecretEncryptedMessage.SecretEncType.MESSAGE_EDIT) ||
+            (messageRaw.messageType === 'protocolMessage' &&
+              (messageRaw.message?.protocolMessage?.editedMessage ||
+                messageRaw.message?.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT));
+
+          if (isUnparsedEditedMessage) {
+            this.logger.warn(
+              `[CW.EDIT] Blocked edited message from normal upsert pipeline whatsappId=${
+                received.key?.id || 'unknown'
+              } messageType=${messageRaw.messageType}`,
+            );
+            continue;
+          }
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
@@ -1600,7 +1963,7 @@ export class BaileysStartupService extends ChannelStartupService {
             pushName: received.key.remoteJid?.includes('@g.us')
               ? await this.resolveGroupContactName(received.key.remoteJid, undefined)
               : received.key.fromMe
-                ? ''
+                ? contact?.pushName || undefined
                 : received.key.fromMe == null
                   ? ''
                   : received.pushName,
@@ -1693,6 +2056,11 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
+        const updateMessage = update.message as proto.IMessage | null | undefined;
+        const editedMessage = await this.extractEditedMessageForEvent(updateMessage, key);
+        const editedMessageContent = editedMessage?.message;
+        const editedMessageKey = editedMessage?.key || key;
+
         const updateType =
           update.status != null ? String(update.status) : Object.keys(update).sort().join(',') || 'unknown';
         const updateKey = `${this.instance.id}_${key.id}_${updateType}`;
@@ -1721,6 +2089,19 @@ export class BaileysStartupService extends ChannelStartupService {
           await this.baileysCache.set(updateKey, update.messageTimestamp, 30 * 60);
         } else {
           await this.baileysCache.set(updateKey, secondsSinceEpoch, 30 * 60);
+        }
+
+        if (editedMessageContent && editedMessageKey?.id) {
+          await this.forwardEditedMessageToChatwoot(
+            'messages.edit',
+            editedMessageKey,
+            editedMessageContent,
+            'messages.update',
+          );
+          await this.sendDataWebhook(Events.MESSAGES_EDITED, {
+            key: editedMessageKey,
+            editedMessage: editedMessageContent,
+          });
         }
 
         if (status[update.status] === 'READ' && key.fromMe) {
@@ -1752,12 +2133,14 @@ export class BaileysStartupService extends ChannelStartupService {
             remoteJid: key?.remoteJid,
             fromMe: key.fromMe,
             participant: key?.participant,
-            status: status[update.status] ?? 'SERVER_ACK',
+            status: editedMessageContent ? 'EDITED' : (status[update.status] ?? 'SERVER_ACK'),
             pollUpdates,
             instanceId: this.instanceId,
           };
 
-          if (update.message) {
+          if (editedMessageContent) {
+            message.message = editedMessageContent;
+          } else if (update.message) {
             message.message = update.message;
           }
 
@@ -1766,7 +2149,8 @@ export class BaileysStartupService extends ChannelStartupService {
           if (configDatabaseData.HISTORIC || configDatabaseData.NEW_MESSAGE) {
             // Use raw SQL to avoid JSON path issues
             const protocolMapKey = `protocol_${key.id}`;
-            const originalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
+            const cachedOriginalMessageId = (await this.baileysCache.get(protocolMapKey)) as string;
+            const originalMessageId = editedMessageContent ? editedMessageKey?.id : cachedOriginalMessageId;
 
             if (originalMessageId) {
               message.keyId = originalMessageId;
@@ -1783,10 +2167,61 @@ export class BaileysStartupService extends ChannelStartupService {
             findMessage = messages[0] || null;
 
             if (!findMessage?.id) {
-              this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
-              continue;
+              if (editedMessageContent && configDatabaseData.NEW_MESSAGE) {
+                const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
+                  ? Math.floor(update.messageTimestamp.toNumber())
+                  : typeof update.messageTimestamp === 'number'
+                    ? Math.floor(update.messageTimestamp)
+                    : Math.floor(Date.now() / 1000);
+                const restoredMessage = this.prepareMessage({
+                  key: editedMessageKey,
+                  message: editedMessageContent,
+                  messageTimestamp: editedMessageTimestamp,
+                } as proto.IWebMessageInfo);
+
+                findMessage = await this.prismaRepository.message.create({
+                  data: {
+                    ...restoredMessage,
+                    status: 'EDITED',
+                  },
+                });
+                this.logger.warn(
+                  `[CW.EDIT] Restored missing Evolution message from edit whatsappId=${editedMessageKey.id}`,
+                );
+              } else {
+                this.logger.warn(`Original message not found for update. Skipping. Key: ${JSON.stringify(key)}`);
+                continue;
+              }
             }
             message.messageId = findMessage.id;
+          }
+
+          if (editedMessageContent && findMessage?.id) {
+            const editedMessageTimestamp = Long.isLong(update.messageTimestamp)
+              ? Math.floor(update.messageTimestamp.toNumber())
+              : typeof update.messageTimestamp === 'number'
+                ? Math.floor(update.messageTimestamp)
+                : Math.floor(Date.now() / 1000);
+            const persistedEditedMessage = this.attachMessageSecret(
+              editedMessageContent,
+              findMessage.message as proto.IMessage,
+            );
+            message.message = persistedEditedMessage;
+
+            await this.prismaRepository.message.update({
+              where: { id: findMessage.id },
+              data: {
+                message: persistedEditedMessage as any,
+                messageTimestamp: editedMessageTimestamp,
+                status: 'EDITED',
+              },
+            });
+
+            await this.chatwootService.ensureChatwootMessageReference(
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              editedMessageKey.id,
+              editedMessageKey,
+            );
           }
 
           if (update.message === null && update.status === undefined) {
@@ -2009,8 +2444,41 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
+  private async forwardPriorityEditedEvents(events: Partial<BaileysEventMap>): Promise<void> {
+    const upsertMessages = events['messages.upsert']?.messages || [];
+    for (const received of upsertMessages) {
+      const editedMessage = await this.extractEditedMessageForEvent(received?.message, received.key);
+      if (editedMessage) {
+        await this.forwardEditedMessageToChatwoot(
+          'messages.edit',
+          editedMessage.key,
+          editedMessage.message,
+          'priority.messages.upsert',
+        );
+      }
+    }
+
+    const messageUpdates = events['messages.update'] || [];
+    for (const { key, update } of messageUpdates) {
+      const editedMessage = await this.extractEditedMessageForEvent(update.message, key);
+      if (editedMessage) {
+        await this.forwardEditedMessageToChatwoot(
+          'messages.edit',
+          editedMessage.key,
+          editedMessage.message,
+          'priority.messages.update',
+        );
+      }
+    }
+  }
+
   private eventHandler() {
     this.client.ev.process(async (events) => {
+      this.forwardPriorityEditedEvents(events).catch((error) => {
+        const errorDetails = error instanceof Error ? error.stack || error.message : JSON.stringify(error);
+        this.logger.error(`[CW.EDIT] Priority edit processing failed: ${errorDetails}`);
+      });
+
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
           if (!this.endSession) {
@@ -4335,14 +4803,14 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (editedMessage) {
           this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-            this.chatwootService.eventWhatsapp(
-              'send.message.update',
-              { instanceName: this.instance.name, instanceId: this.instance.id },
-              editedMessage,
-            );
+          await this.forwardEditedMessageToChatwoot(
+            'send.message.update',
+            editedMessage.key as WAMessageKey,
+            editedMessage.editedMessage as proto.IMessage,
+            'send.message.update',
+          );
 
-          const messageId = messageSent.message?.protocolMessage?.key?.id;
+          const messageId = editedMessage.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
               where: { key: { path: ['id'], equals: messageId } },
@@ -4946,16 +5414,25 @@ export class BaileysStartupService extends ChannelStartupService {
   private prepareMessage(message: proto.IWebMessageInfo): any {
     const contentType = getContentType(message.message);
     const contentMsg = message?.message[contentType] as any;
+    const preparedMessage = this.deserializeMessageBuffers({ ...message.message });
+    const webMessageSecret = this.toMessageBuffer(message.messageSecret);
+
+    if (webMessageSecret && !preparedMessage?.messageContextInfo?.messageSecret) {
+      preparedMessage.messageContextInfo = {
+        ...preparedMessage.messageContextInfo,
+        messageSecret: new Uint8Array(webMessageSecret),
+      };
+    }
 
     const messageRaw = {
       key: message.key, // Save key exactly as it comes from Baileys
-      pushName:
-        message.pushName ||
-        (message.key.fromMe
-          ? 'Você'
-          : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
+      pushName: message.key.fromMe
+        ? null
+        : message.pushName ||
+          message?.participant ||
+          (message.key?.participant ? message.key.participant.split('@')[0] : null),
       status: status[message.status],
-      message: this.deserializeMessageBuffers({ ...message.message }),
+      message: preparedMessage,
       contextInfo: this.deserializeMessageBuffers(contentMsg?.contextInfo),
       messageType: contentType || 'unknown',
       messageTimestamp: Long.isLong(message.messageTimestamp)
