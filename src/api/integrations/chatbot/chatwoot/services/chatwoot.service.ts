@@ -1757,14 +1757,18 @@ export class ChatwootService {
     }
 
     const replyToIds = await this.getReplyToIds(messageBody, instance);
-
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
+    const messageContent = this.addMissingReplyFallback(
+      content,
+      messageBody,
+      !!sourceReplyId || !!replyToIds.in_reply_to,
+    );
 
     const message = await client.messages.create({
       accountId: this.provider.accountId,
       conversationId: conversationId,
       data: {
-        content: content,
+        content: messageContent,
         message_type: messageType,
         attachments: attachments,
         private: privateMessage || false,
@@ -1894,25 +1898,34 @@ export class ChatwootService {
     }
     const data = new FormData();
 
-    if (content) {
-      data.append('content', content);
-    }
-
     data.append('message_type', messageType);
 
     data.append('attachments[]', fileStream, { filename: fileName });
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
+    let replyToIds: { in_reply_to: string; in_reply_to_external_id: string } = {
+      in_reply_to: null,
+      in_reply_to_external_id: null,
+    };
 
     if (messageBody && instance) {
-      const replyToIds = await this.getReplyToIds(messageBody, instance);
+      replyToIds = await this.getReplyToIds(messageBody, instance);
 
       if (replyToIds.in_reply_to || replyToIds.in_reply_to_external_id) {
-        const content = JSON.stringify({
+        const contentAttributes = JSON.stringify({
           ...replyToIds,
         });
-        data.append('content_attributes', content);
+        data.append('content_attributes', contentAttributes);
       }
+    }
+
+    const messageContent = this.addMissingReplyFallback(
+      content || '',
+      messageBody,
+      !!sourceReplyId || !!replyToIds.in_reply_to,
+    );
+    if (messageContent) {
+      data.append('content', messageContent);
     }
 
     if (sourceReplyId) {
@@ -2928,7 +2941,7 @@ export class ChatwootService {
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
+      inReplyToExternalId = this.getReplyContextInfo(msg)?.stanzaId || null;
       if (inReplyToExternalId) {
         const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
         if (message?.chatwootMessageId) {
@@ -2941,6 +2954,93 @@ export class ChatwootService {
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
     };
+  }
+
+  private getReplyContextInfo(msg: any): any | null {
+    const message = msg?.message || msg;
+    const candidates = [
+      msg?.contextInfo,
+      message?.contextInfo,
+      message?.extendedTextMessage?.contextInfo,
+      message?.imageMessage?.contextInfo,
+      message?.videoMessage?.contextInfo,
+      message?.documentMessage?.contextInfo,
+      message?.audioMessage?.contextInfo,
+      message?.stickerMessage?.contextInfo,
+      message?.buttonsResponseMessage?.contextInfo,
+      message?.listResponseMessage?.contextInfo,
+      message?.templateButtonReplyMessage?.contextInfo,
+      message?.interactiveResponseMessage?.contextInfo,
+      message?.documentWithCaptionMessage?.message?.documentMessage?.contextInfo,
+      message?.ephemeralMessage?.message?.extendedTextMessage?.contextInfo,
+      message?.viewOnceMessage?.message?.imageMessage?.contextInfo,
+      message?.viewOnceMessage?.message?.videoMessage?.contextInfo,
+      message?.viewOnceMessageV2?.message?.imageMessage?.contextInfo,
+      message?.viewOnceMessageV2?.message?.videoMessage?.contextInfo,
+    ];
+
+    return candidates.find((contextInfo) => contextInfo?.stanzaId || contextInfo?.quotedMessage) || null;
+  }
+
+  private addMissingReplyFallback(content: string, msg: any, hasChatwootReply: boolean): string {
+    if (hasChatwootReply) {
+      return content;
+    }
+
+    const contextInfo = this.getReplyContextInfo(msg);
+    if (!contextInfo?.stanzaId) {
+      return content;
+    }
+
+    const quotedContent = this.getQuotedContentPreview(contextInfo.quotedMessage);
+    const quotedLines = quotedContent.split('\n').map((line) => `> ${line}`);
+    const fallback = ['↩️ **Respondendo a uma mensagem anterior:**', ...quotedLines].join('\n');
+
+    return content ? `${fallback}\n\n${content}` : fallback;
+  }
+
+  private getQuotedContentPreview(quotedMessage: any): string {
+    if (!quotedMessage) {
+      return '💬 Mensagem indisponível no histórico do Chatwoot';
+    }
+
+    const documentMessage =
+      quotedMessage.documentMessage || quotedMessage.documentWithCaptionMessage?.message?.documentMessage;
+    const text = quotedMessage.conversation || quotedMessage.extendedTextMessage?.text;
+
+    if (text) {
+      return this.truncateReplyPreview(text);
+    }
+
+    if (documentMessage) {
+      const documentLabel = `📎 Documento${documentMessage.fileName ? `: ${documentMessage.fileName}` : ''}`;
+      return documentMessage.caption
+        ? `${documentLabel} — ${this.truncateReplyPreview(documentMessage.caption)}`
+        : documentLabel;
+    }
+    if (quotedMessage.imageMessage) {
+      return quotedMessage.imageMessage.caption
+        ? `🖼️ Imagem — ${this.truncateReplyPreview(quotedMessage.imageMessage.caption)}`
+        : '🖼️ Imagem';
+    }
+    if (quotedMessage.videoMessage) {
+      return quotedMessage.videoMessage.caption
+        ? `🎥 Vídeo — ${this.truncateReplyPreview(quotedMessage.videoMessage.caption)}`
+        : '🎥 Vídeo';
+    }
+    if (quotedMessage.audioMessage) return '🎧 Áudio';
+    if (quotedMessage.stickerMessage) return '🏷️ Figurinha';
+    if (quotedMessage.contactMessage || quotedMessage.contactsArrayMessage) return '👤 Contato';
+    if (quotedMessage.locationMessage || quotedMessage.liveLocationMessage) return '📍 Localização';
+
+    return '💬 Mensagem anterior';
+  }
+
+  private truncateReplyPreview(content: unknown, maxLength = 500): string {
+    const normalizedContent = String(content).replace(/\s+/g, ' ').trim();
+    return normalizedContent.length > maxLength
+      ? `${normalizedContent.substring(0, maxLength - 3)}...`
+      : normalizedContent;
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
@@ -3362,13 +3462,14 @@ export class ChatwootService {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = this.getReplyContextInfo(body)?.stanzaId;
 
         let quotedMsg = null;
 
         if (quotedId)
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
+              instanceId: instance.instanceId,
               key: {
                 path: ['id'],
                 equals: quotedId,
