@@ -51,6 +51,23 @@ docker pull starttrust/evolution-api-chatwoot-sync:latest
 - Added safeguards around WhatsApp group metadata rate limits to avoid repeated `rate-overlimit` errors.
 - Fixed ambiguous SQL references in the Chatwoot import flow.
 - Kept ignored/system WhatsApp JIDs out of Chatwoot history import.
+- Fixed Chatwoot attachments never reaching WhatsApp: Chatwoot serializes `data_url`
+  as a relative ActiveStorage path when the webhook runs without a request host, and
+  Evolution was decoding that path as base64. Relative URLs are now resolved against the
+  configured Chatwoot URL, with fallbacks for `url`/`file_url`/`external_url`/`download_url`.
+- Fixed attachment replies being silently flattened. Outgoing replies are now resolved in
+  three tiers (`in_reply_to` from the local message table, `in_reply_to_external_id` from
+  the local message table, and finally a quote rebuilt from the Chatwoot message itself), and
+  the agent text is kept even when every attachment fails to send.
+- Fixed the reply text being dropped on audio attachments, since WhatsApp has no caption
+  field for audio. The text is now delivered as its own message carrying the reply.
+- Fixed `in_reply_to_external_id` never resolving on the WhatsApp -> Chatwoot direction,
+  because Chatwoot matches it against `messages.source_id` and this integration always
+  stores that column as `WAID:<whatsapp key id>`.
+- Fixed media uploads being rejected when the filename extension was unknown, because
+  `mimeTypes.lookup(...)` returned `false` and `.toString()` produced the literal
+  string `"false"` as the mimetype. Signed storage URLs (`?X-Amz-...`) no longer
+  corrupt the detected extension.
 
 ---
 
