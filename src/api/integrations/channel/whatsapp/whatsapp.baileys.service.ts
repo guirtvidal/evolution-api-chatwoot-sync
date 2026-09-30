@@ -3473,9 +3473,12 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       if (mediaMessage?.fileName) {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName).toString();
-        if (mimetype === 'application/mp4') {
-          mimetype = 'video/mp4';
+        // `mimeTypes.lookup` returns false for unknown extensions. Calling `.toString()` on it
+        // produced the literal string "false" and broke media upload, so only override the
+        // mimetype when the filename actually resolves to one.
+        const fileNameMimeType = mimeTypes.lookup(mediaMessage.fileName);
+        if (fileNameMimeType) {
+          mimetype = fileNameMimeType === 'application/mp4' ? 'video/mp4' : fileNameMimeType;
         }
       }
 

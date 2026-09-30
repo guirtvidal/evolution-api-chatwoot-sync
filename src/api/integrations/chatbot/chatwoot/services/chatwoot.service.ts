@@ -1903,7 +1903,7 @@ export class ChatwootService {
     data.append('attachments[]', fileStream, { filename: fileName });
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
-    let replyToIds: { in_reply_to: string; in_reply_to_external_id: string } = {
+    let replyToIds: { in_reply_to: number | null; in_reply_to_external_id: string | null } = {
       in_reply_to: null,
       in_reply_to_external_id: null,
     };
@@ -2037,7 +2037,115 @@ export class ChatwootService {
     }
   }
 
-  public async sendAttachment(waInstance: any, number: string, media: any, caption?: string, options?: Options) {
+  /**
+   * Chatwoot serializes attachment URLs with ActiveStorage's `url_for`, which returns a
+   * *relative* path when the webhook is delivered from a background job (no request host).
+   * Those paths are unusable as-is: Evolution would treat them as base64 payloads and the
+   * attachment would silently never be sent. Resolve them against the configured Chatwoot URL.
+   */
+  private resolveChatwootMediaUrl(attachment: any): string | null {
+    if (!attachment) {
+      return null;
+    }
+
+    const candidates = [
+      attachment.data_url,
+      attachment.url,
+      attachment.file_url,
+      attachment.external_url,
+      attachment.download_url,
+    ];
+
+    const baseUrl = String(this.provider?.url || '')
+      .trim()
+      .replace(/\/+$/, '');
+
+    for (const candidate of candidates) {
+      if (typeof candidate !== 'string') {
+        continue;
+      }
+
+      const url = candidate.trim();
+      if (!url) {
+        continue;
+      }
+
+      if (/^https?:\/\//i.test(url)) {
+        return url;
+      }
+
+      if (baseUrl && url.startsWith('//')) {
+        return `https:${url}`;
+      }
+
+      if (baseUrl && url.startsWith('/')) {
+        return `${baseUrl}${url}`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Signed storage URLs (S3/CloudFront) carry a query string, so the extension has to be read
+   * from the pathname only. Otherwise `path.parse` returns ".pdf?X-Amz-..." and the mimetype
+   * detection fails.
+   */
+  private getChatwootMediaPathname(mediaUrl: string): string {
+    try {
+      return new URL(mediaUrl).pathname;
+    } catch {
+      return mediaUrl.split('?')[0];
+    }
+  }
+
+  private getChatwootAttachmentMimeType(attachment: any, mediaUrl: string): string {
+    const declared =
+      typeof attachment?.content_type === 'string' ? attachment.content_type.split(';')[0].trim().toLowerCase() : '';
+
+    if (declared && declared !== 'application/octet-stream') {
+      return declared;
+    }
+
+    const extension = typeof attachment?.extension === 'string' ? attachment.extension.replace(/^\./, '') : '';
+    const fromExtension = extension ? mimeTypes.lookup(extension) : false;
+    if (fromExtension) {
+      return fromExtension;
+    }
+
+    const fromUrl = mimeTypes.lookup(path.parse(this.getChatwootMediaPathname(mediaUrl)).ext);
+    if (fromUrl) {
+      return fromUrl;
+    }
+
+    return declared;
+  }
+
+  private buildChatwootFileName(mediaUrl: string, mimeType: string): string {
+    const extension = mimeTypes.extension(mimeType) || '';
+    const baseName = path
+      .parse(decodeURIComponent(this.getChatwootMediaPathname(mediaUrl)))
+      .base.replace(/[/\\?#]/g, '')
+      .trim();
+
+    if (!baseName) {
+      return `chatwoot-attachment${extension}`;
+    }
+
+    if (extension && path.extname(baseName).toLowerCase() !== extension.toLowerCase()) {
+      return `${path.parse(baseName).name}${extension}`;
+    }
+
+    return baseName;
+  }
+
+  public async sendAttachment(
+    waInstance: any,
+    number: string,
+    media: any,
+    caption?: string,
+    options?: Options & { mimeType?: string; fileName?: string },
+  ) {
     try {
       if (!waInstance) {
         throw new Error('WhatsApp instance not found');
@@ -2047,20 +2155,23 @@ export class ChatwootService {
         throw new Error('Attachment URL is invalid');
       }
 
-      const parsedMedia = path.parse(decodeURIComponent(media));
-      let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-      let fileName = parsedMedia?.name + parsedMedia?.ext;
+      let mimeType = options?.mimeType || '';
+      if (!mimeType) {
+        mimeType = mimeTypes.lookup(path.parse(this.getChatwootMediaPathname(media)).ext) || '';
+      }
 
       if (!mimeType) {
-        const parts = media.split('/');
-        fileName = decodeURIComponent(parts[parts.length - 1]);
-
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
           timeout: 30_000,
         });
-        mimeType = response.headers['content-type'];
+        mimeType = String(response.headers['content-type'] || '')
+          .split(';')[0]
+          .trim();
       }
+
+      // Resolved after the mimetype sniffing so the filename always carries a valid extension.
+      const fileName = options?.fileName || this.buildChatwootFileName(media, mimeType);
 
       let type = 'document';
 
@@ -2080,6 +2191,8 @@ export class ChatwootService {
       }
 
       if (type === 'audio') {
+        // WhatsApp has no caption field for audio messages, so `caption` is intentionally
+        // dropped here. Callers must deliver the text as its own message instead of losing it.
         const data: SendAudioDto = {
           number: number,
           audio: media,
@@ -2095,7 +2208,7 @@ export class ChatwootService {
       }
 
       const documentExtensions = ['.gif', '.svg', '.tiff', '.tif', '.dxf', '.dwg'];
-      if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
+      if (type === 'image' && documentExtensions.includes(path.parse(fileName).ext.toLowerCase())) {
         type = 'document';
       }
 
@@ -2104,6 +2217,7 @@ export class ChatwootService {
         mediatype: type as any,
         fileName: fileName,
         media: media,
+        mimetype: mimeType || undefined,
         delay: 1200,
         quoted: options?.quoted,
       };
@@ -2120,6 +2234,69 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(`Error sending Chatwoot attachment to WhatsApp: ${this.formatError(error)}`);
       throw error; // Re-throw para que o erro seja tratado pelo caller
+    }
+  }
+
+  /**
+   * Sends an outgoing text message to WhatsApp and links it back to the Chatwoot message.
+   * Returns `null` when the delivery was already performed (duplicate webhook).
+   */
+  private async sendOutgoingText(
+    instance: InstanceDto,
+    waInstance: any,
+    chatId: string,
+    body: any,
+    text: string,
+    quoted: Quoted,
+    deliveryKey: string,
+  ): Promise<any> {
+    if (!(await this.beginOutgoingDelivery(deliveryKey))) {
+      return null;
+    }
+
+    const data: SendTextDto = {
+      number: chatId,
+      text: text,
+      delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
+      quoted: quoted,
+    };
+
+    sendTelemetry('/message/sendText');
+
+    let messageSent: any;
+    let textSent = false;
+    try {
+      messageSent = await waInstance?.textMessage(data, true);
+      if (!messageSent) {
+        throw new Error('Message not sent');
+      }
+
+      if (Long.isLong(messageSent?.messageTimestamp)) {
+        messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+      }
+
+      await this.updateChatwootMessageId(
+        {
+          ...messageSent,
+        },
+        {
+          messageId: body.id,
+          inboxId: body.inbox?.id,
+          conversationId: body.conversation?.id,
+          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+        },
+        instance,
+      );
+      textSent = true;
+
+      return messageSent;
+    } catch (error) {
+      if (!messageSent && body.conversation?.id) {
+        await this.onSendMessageError(instance, body.conversation?.id, error);
+      }
+      throw error;
+    } finally {
+      await this.finishOutgoingDelivery(deliveryKey, textSent);
     }
   }
 
@@ -2360,7 +2537,7 @@ export class ChatwootService {
         const attachments = Array.isArray(body.attachments)
           ? body.attachments
           : currentConversationMessage?.attachments || [];
-        const quotedMessage = await this.getQuotedMessage(body, instance);
+        const quotedMessage = await this.resolveOutgoingReply(body, chatId, instance);
         const deliveryMessageId = body.id || body.source_id || `${body.conversation.id}:${body.created_at}`;
 
         if (attachments.length > 0) {
@@ -2368,8 +2545,13 @@ export class ChatwootService {
             `[CW.ATTACHMENT] Sending ${attachments.length} attachment(s) from Chatwoot message ${body.id}`,
           );
 
+          let attachmentDelivered = false;
+          let textDelivered = false;
+
           for (const [index, attachment] of attachments.entries()) {
-            const mediaUrl = attachment.data_url || attachment.file_url;
+            const mediaUrl = this.resolveChatwootMediaUrl(attachment);
+            const mimeType = mediaUrl ? this.getChatwootAttachmentMimeType(attachment, mediaUrl) : '';
+            const fileName = mediaUrl ? this.buildChatwootFileName(mediaUrl, mimeType) : undefined;
             const caption = index === 0 && messageReceived ? formatText : undefined;
             const deliveryKey = `${instance.instanceName}:chatwoot-outgoing:${deliveryMessageId}:attachment:${index}`;
 
@@ -2382,17 +2564,50 @@ export class ChatwootService {
 
             if (!mediaUrl) {
               this.logger.error(
-                `[CW.ATTACHMENT] Attachment ${index + 1}/${attachments.length} has no media URL (message ${body.id})`,
+                `[CW.ATTACHMENT] Attachment ${index + 1}/${attachments.length} has no resolvable media URL (message ${body.id})`,
               );
               await this.finishOutgoingDelivery(deliveryKey, false);
               continue;
             }
 
+            // WhatsApp cannot attach a caption to audio, so the text is delivered as its own
+            // message (carrying the reply) instead of being dropped along with the caption.
+            const supportsCaption = !mimeType.startsWith('audio/');
+
+            if (caption && !supportsCaption) {
+              try {
+                await this.sendOutgoingText(
+                  instance,
+                  waInstance,
+                  chatId,
+                  body,
+                  caption,
+                  quotedMessage,
+                  `${instance.instanceName}:chatwoot-outgoing:${deliveryMessageId}:attachment-caption`,
+                );
+                textDelivered = true;
+              } catch (error) {
+                this.logger.error(
+                  `[CW.ATTACHMENT] Failed to send caption for attachment ${index + 1} from message ${body.id}: ${this.formatError(
+                    error,
+                  )}`,
+                );
+              }
+            }
+
             let attachmentSent = false;
             try {
-              const messageSent = await this.sendAttachment(waInstance, chatId, mediaUrl, caption, {
-                quoted: quotedMessage,
-              });
+              const messageSent = await this.sendAttachment(
+                waInstance,
+                chatId,
+                mediaUrl,
+                caption && supportsCaption ? caption : undefined,
+                {
+                  quoted: quotedMessage,
+                  mimeType,
+                  fileName,
+                },
+              );
 
               if (!messageSent) {
                 throw new Error('Attachment not sent');
@@ -2415,6 +2630,7 @@ export class ChatwootService {
                 `[CW.ATTACHMENT] Sent attachment ${index + 1}/${attachments.length} from Chatwoot message ${body.id}`,
               );
               attachmentSent = true;
+              attachmentDelivered = true;
             } catch (error) {
               const errorDetails = error instanceof Error ? error.stack || error.message : JSON.stringify(error);
               this.logger.error(
@@ -2429,54 +2645,33 @@ export class ChatwootService {
               await this.finishOutgoingDelivery(deliveryKey, attachmentSent);
             }
           }
+
+          // Never let the agent's text disappear just because the attachment could not be sent.
+          if (messageReceived && !attachmentDelivered && !textDelivered) {
+            await this.sendOutgoingText(
+              instance,
+              waInstance,
+              chatId,
+              body,
+              formatText,
+              quotedMessage,
+              `${instance.instanceName}:chatwoot-outgoing:${deliveryMessageId}:text`,
+            );
+          }
         } else {
-          const deliveryKey = `${instance.instanceName}:chatwoot-outgoing:${deliveryMessageId}:text`;
-          if (!(await this.beginOutgoingDelivery(deliveryKey))) {
+          const textDelivered = await this.sendOutgoingText(
+            instance,
+            waInstance,
+            chatId,
+            body,
+            formatText,
+            quotedMessage,
+            `${instance.instanceName}:chatwoot-outgoing:${deliveryMessageId}:text`,
+          );
+
+          if (!textDelivered) {
             this.logger.warn(`[CW.OUTGOING] Skipping duplicate text message ${body.id}`);
             return { message: 'bot' };
-          }
-
-          const data: SendTextDto = {
-            number: chatId,
-            text: formatText,
-            delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
-            quoted: quotedMessage,
-          };
-
-          sendTelemetry('/message/sendText');
-
-          let messageSent: any;
-          let textSent = false;
-          try {
-            messageSent = await waInstance?.textMessage(data, true);
-            if (!messageSent) {
-              throw new Error('Message not sent');
-            }
-
-            if (Long.isLong(messageSent?.messageTimestamp)) {
-              messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
-            }
-
-            await this.updateChatwootMessageId(
-              {
-                ...messageSent,
-              },
-              {
-                messageId: body.id,
-                inboxId: body.inbox?.id,
-                conversationId: body.conversation?.id,
-                contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-              },
-              instance,
-            );
-            textSent = true;
-          } catch (error) {
-            if (!messageSent && body.conversation?.id) {
-              await this.onSendMessageError(instance, body.conversation?.id, error);
-            }
-            throw error;
-          } finally {
-            await this.finishOutgoingDelivery(deliveryKey, textSent);
           }
         }
 
@@ -2936,14 +3131,15 @@ export class ChatwootService {
   private async getReplyToIds(
     msg: any,
     instance: InstanceDto,
-  ): Promise<{ in_reply_to: string; in_reply_to_external_id: string }> {
-    let inReplyTo = null;
-    let inReplyToExternalId = null;
+  ): Promise<{ in_reply_to: number | null; in_reply_to_external_id: string | null }> {
+    let inReplyTo: number | null = null;
+    let inReplyToExternalId: string | null = null;
 
     if (msg) {
-      inReplyToExternalId = this.getReplyContextInfo(msg)?.stanzaId || null;
-      if (inReplyToExternalId) {
-        const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      const stanzaId = this.getReplyContextInfo(msg)?.stanzaId || null;
+      if (stanzaId) {
+        inReplyToExternalId = `WAID:${stanzaId}`;
+        const message = await this.getMessageByKeyId(instance, stanzaId);
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
@@ -3043,11 +3239,31 @@ export class ChatwootService {
       : normalizedContent;
   }
 
+  private getRepliedChatwootMessageId(msg: any): number | null {
+    const inReplyTo = Number(msg?.content_attributes?.in_reply_to);
+    return Number.isFinite(inReplyTo) && inReplyTo > 0 ? inReplyTo : null;
+  }
+
+  private getRepliedExternalId(msg: any): string | null {
+    const externalId = msg?.content_attributes?.in_reply_to_external_id;
+    if (typeof externalId === 'string' && externalId) {
+      return externalId.replace(/^WAID:/, '');
+    }
+    return null;
+  }
+
+  private hasOutgoingReplyIntent(msg: any): boolean {
+    return !!this.getRepliedChatwootMessageId(msg) || !!this.getRepliedExternalId(msg);
+  }
+
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
-    if (msg?.content_attributes?.in_reply_to) {
+    const inReplyTo = this.getRepliedChatwootMessageId(msg);
+    const inReplyToExternalId = this.getRepliedExternalId(msg);
+
+    if (inReplyTo) {
       const message = await this.prismaRepository.message.findFirst({
         where: {
-          chatwootMessageId: msg?.content_attributes?.in_reply_to,
+          chatwootMessageId: inReplyTo,
           instanceId: instance.instanceId,
         },
       });
@@ -3063,7 +3279,90 @@ export class ChatwootService {
       }
     }
 
+    // Fallback: the replied message may not be linked to a Chatwoot id yet (e.g. the linkage
+    // update raced the webhook), but we can still resolve it through the WhatsApp key id.
+    if (inReplyToExternalId) {
+      const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      const key = message?.key as WAMessageKey;
+      const messageContent = message?.message as WAMessageContent;
+
+      if (messageContent && key?.id) {
+        return {
+          key: key,
+          message: messageContent,
+        };
+      }
+    }
+
     return null;
+  }
+
+  /**
+   * Resolves the WhatsApp message an agent replied to from Chatwoot.
+   *
+   * The local `Message` table is the primary source, but messages that were created before
+   * the integration was enabled (or while message persistence was disabled) only exist in
+   * Chatwoot. In that case the quoted payload is rebuilt from Chatwoot itself so the reply
+   * is preserved instead of being silently flattened into a plain message.
+   */
+  private async resolveOutgoingReply(msg: any, chatId: string, instance: InstanceDto): Promise<Quoted> {
+    if (!this.hasOutgoingReplyIntent(msg)) {
+      return null;
+    }
+
+    const quoted = await this.getQuotedMessage(msg, instance);
+    if (quoted) {
+      return quoted;
+    }
+
+    const inReplyTo = this.getRepliedChatwootMessageId(msg);
+    if (!inReplyTo) {
+      this.logger.warn(
+        `[CW.REPLY] Reply target ${msg?.content_attributes?.in_reply_to_external_id || 'unknown'} could not be resolved for chat ${chatId}`,
+      );
+      return null;
+    }
+
+    try {
+      const result = await this.pgClient.query(
+        `SELECT id, content, message_type, source_id
+         FROM messages
+         WHERE id = $1
+           AND account_id = $2
+         LIMIT 1`,
+        [inReplyTo, this.provider.accountId],
+      );
+
+      const row = result?.rows?.[0];
+      const content = typeof row?.content === 'string' ? row.content.trim() : '';
+
+      if (!row || !content) {
+        this.logger.warn(
+          `[CW.REPLY] Replied message ${inReplyTo} has no content to rebuild the quote from (conversation ${msg?.conversation?.id})`,
+        );
+        return null;
+      }
+
+      const key: WAMessageKey = {
+        remoteJid: chatId,
+        fromMe: row.message_type === 'outgoing',
+        id: String(row.source_id || inReplyTo).replace(/^WAID:/, ''),
+      };
+
+      this.logger.info(
+        `[CW.REPLY] Rebuilt quoted message from Chatwoot chatwootMessageId=${inReplyTo} whatsappId=${key.id}`,
+      );
+
+      return {
+        key,
+        message: {
+          conversation: content.length > 2000 ? `${content.substring(0, 1997)}...` : content,
+        } as WAMessageContent,
+      };
+    } catch (error) {
+      this.logger.warn(`[CW.REPLY] Unable to rebuild quoted message ${inReplyTo}: ${this.formatError(error)}`);
+      return null;
+    }
   }
 
   private isMediaMessage(message: any) {
